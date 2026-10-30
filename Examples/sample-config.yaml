@@ -1,0 +1,38 @@
+# Illustrative local fixture. All domains are reserved examples; no working credentials.
+apiVersion: v1
+kind: Config
+clusters:
+- name: development
+  cluster:
+    server: https://dev.example.invalid:6443
+- name: production-eu
+  cluster:
+    server: https://prod-eu.example.invalid:6443
+- name: local
+  cluster:
+    server: https://127.0.0.1:6443
+users:
+- name: developer
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: example-credential-plugin
+      interactiveMode: Never
+- name: local-admin
+  user: {}
+contexts:
+- name: development
+  context:
+    cluster: development
+    user: developer
+    namespace: platform
+- name: production-eu
+  context:
+    cluster: production-eu
+    user: developer
+    namespace: workloads
+- name: local
+  context:
+    cluster: local
+    user: local-admin
+current-context: development
