@@ -37,6 +37,10 @@ final class AppModelTests: XCTestCase {
         ConfigurationDiff.changes(in: try ConfigurationDiff.lines(before: model.snapshot?.text ?? "", after: XCTUnwrap(model.document))).count
     }
 
+    @MainActor private func exportedDocument(_ model: AppModel) throws -> KubeDocument {
+        try KubeDocument(yaml: XCTUnwrap(model.contextExportPlan).yaml)
+    }
+
     func testApplyCountMatchesReviewForARenamedActiveContext() async throws {
         try await withModel { model, _ in
             model.editor?.name = "renamed"
@@ -1331,6 +1335,388 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testContextMultiSelectionCommitsTheFormAndDisablesSingleEntryActions() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["namespace"] = "pending"
+            model.selectContexts(["dev", "other"])
+            XCTAssertTrue(model.hasMultipleContextSelection)
+            XCTAssertNil(model.selectedName)
+            XCTAssertNil(model.editor)
+            XCTAssertEqual(model.document?.entry(.contexts, named: "dev")?.value("namespace"), "pending")
+            XCTAssertTrue(model.canExportContexts)
+            let draft = model.draftText
+            model.makeActive("other")
+            model.clearActive()
+            model.duplicateEntry("dev")
+            model.deleteEntry("other")
+            XCTAssertEqual(model.draftText, draft)
+            XCTAssertNotNil(model.deleteBlockReason("dev"))
+            model.selectContexts(["other"])
+            XCTAssertEqual(model.selectedName, "other")
+            XCTAssertEqual(model.editor?.originalName, "other")
+            XCTAssertFalse(model.hasMultipleContextSelection)
+        }
+    }
+
+    func testNativeContextListSupportsMultipleSelectionAndUpdatesTheInspector() async throws {
+        try await withModel { model, _ in
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+                                  styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: MainView(model: model))
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(300))
+            let table = try XCTUnwrap(Self.tables(in: host).first { $0.allowsMultipleSelection })
+            table.selectRowIndexes(IndexSet(integersIn: 0..<2), byExtendingSelection: false)
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+            XCTAssertTrue(model.hasMultipleContextSelection)
+            XCTAssertNil(model.editor)
+            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(model.selectedContextNames, ["other"])
+            XCTAssertEqual(model.editor?.originalName, "other")
+            model.editor?.name = "renamed"
+            model.commitForm()
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(model.selectedContextNames, ["renamed"])
+            XCTAssertEqual(model.editor?.originalName, "renamed")
+            model.selectContexts(["dev", "renamed"])
+            model.toggleRawEditor()
+            try await Task.sleep(for: .milliseconds(100))
+            model.toggleRawEditor()
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(model.selectedContextNames, ["dev", "renamed"])
+            XCTAssertNil(model.editor)
+        }
+    }
+
+    @MainActor private static func tables(in view: NSView) -> [NSTableView] {
+        (view as? NSTableView).map { [$0] } ?? view.subviews.flatMap { tables(in: $0) }
+    }
+
+    func testQueuedNativeContextSelectionCannotReplaceSelectionAfterLoadingAnotherFile() async throws {
+        try await withModel { model, url in
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+                                  styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: MainView(model: model))
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(300))
+            let table = try XCTUnwrap(Self.tables(in: host).first { $0.allowsMultipleSelection })
+            let next = url.deletingLastPathComponent().appendingPathComponent("next-config")
+            let yaml = Self.fixture.replacingOccurrences(of: "contexts:\n", with: "contexts:\n- name: aaa\n  context: {cluster: dev}\n")
+            try Data(yaml.utf8).write(to: next)
+            table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+            model.load(next)
+            XCTAssertEqual(model.selectedContextNames, ["aaa"])
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(model.selectedContextNames, ["aaa"])
+            XCTAssertEqual(model.editor?.originalName, "aaa")
+            XCTAssertEqual(model.snapshot?.url, next)
+        }
+    }
+
+    func testQueuedContextSelectionsCoalesceAndExpireWhenTheWorkspaceChanges() async throws {
+        try await withModel { model, _ in
+            model.queueContextSelection(["other"])
+            model.queueContextSelection(["dev", "other"])
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(model.selectedContextNames, ["dev", "other"], "The latest queued request wins")
+
+            model.queueContextSelection(["other"])
+            model.selectEntry("dev")
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+
+            model.queueContextSelection(["other"])
+            model.search = "dev"
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            model.search = ""
+
+            model.queueContextSelection(["other"])
+            model.toggleRawEditor()
+            model.toggleRawEditor()
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+
+            model.queueContextSelection(["other"])
+            model.selectSection(.clusters)
+            model.selectSection(.contexts)
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+        }
+    }
+
+    func testContextMultiSelectionFollowsARenameCommittedByTheSelectionChange() async throws {
+        try await withModel { model, _ in
+            model.editor?.name = "renamed"
+            model.selectContexts(["dev", "other"])
+            XCTAssertEqual(model.selectedContextNames, ["renamed", "other"])
+            model.requestContextExport()
+            XCTAssertEqual(Set(try exportedDocument(model).entries(.contexts).map(\.name)), ["renamed", "other"])
+        }
+    }
+
+    func testFocusedContextRenameClearsAFilterThatWouldHideItsExport() async throws {
+        try await withModel { model, url in
+            model.search = "other"
+            model.selectEntry("other")
+            model.editor?.name = "renamed"
+            model.editor?.fields["namespace"] = "pending"
+            model.requestContextExport()
+            XCTAssertNil(model.errorMessage)
+            XCTAssertEqual(model.search, "")
+            XCTAssertEqual(model.selectedContextNames, ["renamed"])
+            let exported = try exportedDocument(model)
+            XCTAssertEqual(exported.entries(.contexts).map(\.name), ["renamed"])
+            XCTAssertEqual(exported.entry(.contexts, named: "renamed")?.value("namespace"), "pending")
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+            XCTAssertTrue(model.hasPendingChanges)
+        }
+    }
+
+    func testInvalidFormPreventsChangingContextSelectionOrExporting() async throws {
+        try await withModel { model, _ in
+            model.editor?.name = ""
+            model.selectContexts(["dev", "other"])
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.editor?.name, "")
+            model.errorMessage = nil
+            model.requestContextExport()
+            XCTAssertNotNil(model.errorMessage)
+            XCTAssertNil(model.contextExportPlan)
+        }
+    }
+
+    func testSearchRemovesHiddenContextsFromSelectionAndExport() async throws {
+        try await withModel { model, _ in
+            model.selectContexts(["dev", "other"])
+            model.search = "other"
+            XCTAssertEqual(model.selectedContextNames, ["other"])
+            XCTAssertEqual(model.editor?.originalName, "other")
+            model.requestContextExport()
+            XCTAssertEqual(try exportedDocument(model).entries(.contexts).map(\.name), ["other"])
+            model.closeContextExport()
+            model.search = "no-match"
+            XCTAssertTrue(model.selectedContextNames.isEmpty)
+            XCTAssertNil(model.editor)
+            XCTAssertFalse(model.canExportContexts)
+            model.search = ""
+            XCTAssertTrue(model.selectedContextNames.isEmpty, "Clearing search must not silently reselect hidden entries")
+        }
+    }
+
+    func testSearchKeepsInvalidUnfinishedEditsVisible() async throws {
+        try await withModel { model, _ in
+            model.editor?.name = ""
+            model.search = "other"
+            XCTAssertEqual(model.search, "")
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.editor?.name, "")
+            XCTAssertNotNil(model.errorMessage)
+        }
+    }
+
+    func testExportAvailabilityAndSelectionAcrossModesSectionsAndSheets() async throws {
+        try await withModel { model, _ in
+            model.selectContexts(["dev", "other"])
+            model.toggleRawEditor()
+            XCTAssertFalse(model.canExportContexts)
+            model.toggleRawEditor()
+            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+            XCTAssertTrue(model.hasMultipleContextSelection)
+            model.showImportSource = true
+            XCTAssertFalse(model.canExportContexts)
+            model.requestContextExport()
+            XCTAssertNil(model.contextExportPlan)
+            model.showImportSource = false
+            model.selectSection(.clusters)
+            XCTAssertFalse(model.canExportContexts)
+            XCTAssertTrue(model.selectedContextNames.isEmpty)
+            model.selectSection(.contexts)
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            model.requestContextExport()
+            XCTAssertTrue(model.sheetIsOpen)
+            XCTAssertFalse(model.canExportContexts)
+            model.closeContextExport()
+            XCTAssertFalse(model.sheetIsOpen)
+            XCTAssertTrue(model.canExportContexts)
+        }
+    }
+
+    func testSelectedContextExportUsesTheDraftAndLeavesDiskSelectionAndUndoIntact() async throws {
+        try await withModel { model, url in
+            model.editor?.fields["namespace"] = "exported"
+            model.requestContextExport()
+            let plan = try XCTUnwrap(model.contextExportPlan)
+            let exported = try KubeDocument(yaml: plan.yaml)
+            XCTAssertEqual(exported.entries(.contexts).map(\.name), ["dev"])
+            XCTAssertEqual(exported.entry(.contexts, named: "dev")?.value("namespace"), "exported")
+            let destination = url.deletingLastPathComponent().appendingPathComponent("subset.yaml")
+            model.chooseExportURL = { _, _ in destination }
+            try model.saveContextExport()
+            XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), plan.yaml)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertTrue(model.hasPendingChanges)
+            XCTAssertNil(model.contextExportPlan)
+            let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+            XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+            model.undo()
+            XCTAssertEqual(model.draftText, Self.fixture)
+        }
+    }
+
+    func testCancelledOrFailedContextExportKeepsTheReviewAndSelection() async throws {
+        try await withModel { model, url in
+            model.selectContexts(["dev", "other"])
+            model.requestContextExport()
+            model.chooseExportURL = { _, _ in nil }
+            try model.saveContextExport()
+            XCTAssertNotNil(model.contextExportPlan)
+            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+            model.chooseExportURL = { _, _ in url }
+            XCTAssertThrowsError(try model.saveContextExport())
+            let alias = url.deletingLastPathComponent().appendingPathComponent("alias")
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: url)
+            model.chooseExportURL = { _, _ in alias }
+            XCTAssertThrowsError(try model.saveContextExport())
+            XCTAssertNotNil(model.contextExportPlan)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+        }
+    }
+
+    func testContextExportEmbedsAFileOnceAndCannotOverwriteItsSource() async throws {
+        let yaml = Self.fixture.replacingOccurrences(of: "server: 'https://dev.invalid'", with: "server: 'https://dev.invalid', certificate-authority: ca.pem")
+        try await withModel(initial: yaml) { model, url in
+            let certificate = url.deletingLastPathComponent().appendingPathComponent("ca.pem")
+            try Data("certificate".utf8).write(to: certificate)
+            model.selectContexts(["dev", "other"])
+            model.requestContextExport()
+            let plan = try XCTUnwrap(model.contextExportPlan)
+            XCTAssertTrue(plan.sourceFiles.contains(certificate.standardizedFileURL))
+            XCTAssertTrue(plan.sourceFiles.contains(certificate.resolvingSymlinksInPath()))
+            model.chooseExportURL = { _, _ in certificate }
+            XCTAssertThrowsError(try model.saveContextExport())
+            XCTAssertEqual(try String(contentsOf: certificate, encoding: .utf8), "certificate")
+            try Data("changed externally".utf8).write(to: certificate)
+            let destination = url.deletingLastPathComponent().appendingPathComponent("export.yaml")
+            model.chooseExportURL = { _, _ in destination }
+            try model.saveContextExport()
+            XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), plan.yaml, "Save must use the reviewed file snapshot")
+        }
+    }
+
+    func testContextExportProtectsOriginalAndCurrentTargetsOfARetargetedCredentialSymlink() async throws {
+        let yaml = Self.fixture.replacingOccurrences(of: "server: 'https://dev.invalid'", with: "server: 'https://dev.invalid', certificate-authority: ca-link")
+        try await withModel(initial: yaml) { model, url in
+            let folder = url.deletingLastPathComponent()
+            let alias = folder.appendingPathComponent("ca-link")
+            let original = folder.appendingPathComponent("original.pem")
+            let replacement = folder.appendingPathComponent("replacement.pem")
+            try Data("original certificate".utf8).write(to: original)
+            try Data("replacement certificate".utf8).write(to: replacement)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: original)
+            model.requestContextExport()
+            XCTAssertNotNil(model.contextExportPlan)
+            try FileManager.default.removeItem(at: alias)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: replacement)
+
+            for destination in [original, replacement, alias] {
+                model.chooseExportURL = { _, _ in destination }
+                XCTAssertThrowsError(try model.saveContextExport())
+                XCTAssertNotNil(model.contextExportPlan)
+                XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "original certificate")
+                XCTAssertEqual(try String(contentsOf: replacement, encoding: .utf8), "replacement certificate")
+            }
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: alias.path), replacement.path)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), yaml)
+        }
+    }
+
+    func testMissingExportDependencyPreservesTheDraftAndCanBeRetried() async throws {
+        let yaml = Self.fixture.replacingOccurrences(of: "server: 'https://dev.invalid'", with: "server: 'https://dev.invalid', certificate-authority: ca.pem")
+        try await withModel(initial: yaml) { model, url in
+            model.editor?.fields["namespace"] = "pending"
+            model.requestContextExport()
+            XCTAssertNil(model.contextExportPlan)
+            XCTAssertNotNil(model.errorMessage)
+            XCTAssertTrue(model.hasPendingChanges)
+            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            try Data("certificate".utf8).write(to: url.deletingLastPathComponent().appendingPathComponent("ca.pem"))
+            model.errorMessage = nil
+            model.requestContextExport()
+            XCTAssertNotNil(model.contextExportPlan)
+            XCTAssertEqual(try exportedDocument(model).entry(.contexts, named: "dev")?.value("namespace"), "pending")
+        }
+    }
+
+    func testUnrelatedValidationIssuesDoNotBlockContextExport() async throws {
+        let yaml = Self.fixture.replacingOccurrences(of: "context: {cluster: dev}", with: "context: {cluster: missing}")
+        try await withModel(initial: yaml) { model, _ in
+            XCTAssertFalse(model.validationIssues.isEmpty)
+            model.requestContextExport()
+            XCTAssertNotNil(model.contextExportPlan)
+            model.closeContextExport()
+            model.selectEntry("other")
+            model.requestContextExport()
+            XCTAssertNil(model.contextExportPlan)
+            XCTAssertNotNil(model.errorMessage)
+        }
+    }
+
+    func testFileDropOpensImportReviewWithResolvedPathsAndDoesNotWrite() async throws {
+        try await withModel { model, url in
+            let incoming = url.deletingLastPathComponent().appendingPathComponent("provider.yaml")
+            try Data("clusters: [{name: imported, cluster: {server: 'https://new.invalid', certificate-authority: ca.pem}}]".utf8).write(to: incoming)
+            model.editor?.fields["namespace"] = "pending"
+            XCTAssertTrue(model.importDroppedFiles([incoming]))
+            XCTAssertTrue(model.showImport)
+            XCTAssertFalse(model.showImportSource)
+            XCTAssertEqual(model.importPlan?.incoming.entry(.clusters, named: "imported")?.value("certificate-authority"), incoming.deletingLastPathComponent().appendingPathComponent("ca.pem").standardizedFileURL.path)
+            XCTAssertTrue(model.hasPendingChanges)
+            XCTAssertNil(model.document?.entry(.clusters, named: "imported"))
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+            XCTAssertFalse(model.importDroppedFiles([incoming]), "Do not replace an open review")
+        }
+    }
+
+    func testDropsRejectMultipleFilesURLsAndMalformedFilesWithoutChangingTheDraft() async throws {
+        try await withModel { model, url in
+            let initial = model.draftText
+            for files in [[url, url], [URL(string: "https://example.invalid/config")!], []] {
+                XCTAssertFalse(model.importDroppedFiles(files))
+                XCTAssertNotNil(model.errorMessage)
+                XCTAssertNil(model.importPlan)
+                XCTAssertEqual(model.draftText, initial)
+                model.errorMessage = nil
+            }
+            let malformed = url.deletingLastPathComponent().appendingPathComponent("bad")
+            try Data("contexts: [".utf8).write(to: malformed)
+            XCTAssertFalse(model.importDroppedFiles([malformed]))
+            XCTAssertNotNil(model.errorMessage)
+            XCTAssertFalse(model.showImport)
+            XCTAssertEqual(model.draftText, initial)
+        }
+    }
+
+    func testFileDropCanImportIntoAMissingConfiguration() async throws {
+        try await withModel(initial: nil) { model, url in
+            let incoming = url.deletingLastPathComponent().appendingPathComponent("provider")
+            try Data(Self.fixture.utf8).write(to: incoming)
+            XCTAssertTrue(model.importDroppedFiles([incoming]))
+            XCTAssertTrue(model.showImport)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
     func testRetentionStaysWithinItsRange() async throws {
         try await withModel { model, _ in
             XCTAssertEqual(model.retention, BackupRetention.defaultCount)
@@ -1458,24 +1844,24 @@ final class AppModelTests: XCTestCase {
             model.columnVisibility = .detailOnly
             model.find()
             XCTAssertEqual(model.searchFocusRequest, 1)
-            XCTAssertEqual(model.columnVisibility, .doubleColumn)
+            XCTAssertEqual(model.columnVisibility, .detailOnly, "Find focuses the list without expanding the sidebar")
             model.toggleRawEditor()
             model.find()
             XCTAssertEqual(model.searchFocusRequest, 1)
         }
     }
 
-    func testSidebarCollapseDependsOnTheColumnsInUse() async throws {
+    func testSidebarVisibilityStaysTheSameWhenTogglingTheEditor() async throws {
         try await withModel { model, _ in
             XCTAssertFalse(model.sidebarIsCollapsed)
             model.toggleSidebar()
-            XCTAssertEqual(model.columnVisibility, .doubleColumn)
+            XCTAssertEqual(model.columnVisibility, .detailOnly)
             XCTAssertTrue(model.sidebarIsCollapsed)
             model.toggleRawEditor()
-            XCTAssertEqual(model.columnVisibility, .detailOnly, "YAML mode has no list, so two columns would include the sidebar")
+            XCTAssertEqual(model.columnVisibility, .detailOnly)
             XCTAssertTrue(model.sidebarIsCollapsed)
             model.toggleRawEditor()
-            XCTAssertEqual(model.columnVisibility, .doubleColumn)
+            XCTAssertEqual(model.columnVisibility, .detailOnly)
             model.toggleSidebar()
             XCTAssertEqual(model.columnVisibility, .all)
             model.toggleRawEditor()
@@ -1483,6 +1869,69 @@ final class AppModelTests: XCTestCase {
             model.toggleSidebar()
             XCTAssertEqual(model.columnVisibility, .detailOnly)
         }
+    }
+
+    func testSidebarVisibilitySurvivesRelaunchFromEitherEditorMode() async throws {
+        try await withModel { model, url in
+            for raw in [false, true] {
+                if model.showRaw != raw { model.toggleRawEditor() }
+                model.columnVisibility = .detailOnly
+                let collapsed = AppModel(store: model.store, defaults: model.defaults, initialURL: url)
+                XCTAssertTrue(collapsed.sidebarIsCollapsed)
+                XCTAssertEqual(collapsed.columnVisibility, .detailOnly)
+
+                model.columnVisibility = .all
+                let expanded = AppModel(store: model.store, defaults: model.defaults, initialURL: url)
+                XCTAssertFalse(expanded.sidebarIsCollapsed)
+                XCTAssertEqual(expanded.columnVisibility, .all)
+            }
+        }
+    }
+
+    func testChangingSectionsAndReloadingKeepsTheSidebarCollapsed() async throws {
+        try await withModel { model, url in
+            model.toggleSidebar()
+            model.toggleRawEditor()
+            model.selectSection(.clusters)
+            XCTAssertFalse(model.showRaw)
+            XCTAssertTrue(model.sidebarIsCollapsed)
+            model.toggleRawEditor()
+            model.load(url)
+            XCTAssertFalse(model.showRaw)
+            XCTAssertTrue(model.sidebarIsCollapsed)
+            XCTAssertTrue(AppModel(store: model.store, defaults: model.defaults, initialURL: url).sidebarIsCollapsed)
+        }
+    }
+
+    func testEditorToggleKeepsTheNativeSidebarCollapsedWithoutRecreatingIt() async throws {
+        try await withModel { model, _ in
+            model.toggleSidebar()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+                                  styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: MainView(model: model))
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            try await Task.sleep(for: .milliseconds(300))
+            let split = try XCTUnwrap(Self.splitView(in: host))
+            let controller = try XCTUnwrap(split.delegate as? NSSplitViewController)
+            let sidebar = try XCTUnwrap(controller.splitViewItems.first)
+            XCTAssertTrue(sidebar.isCollapsed)
+
+            for _ in 0..<4 {
+                model.toggleRawEditor()
+                try await Task.sleep(for: .milliseconds(100))
+                XCTAssertTrue(Self.splitView(in: host) === split, "The sidebar's native split view survives mode changes")
+                XCTAssertTrue(sidebar.isCollapsed)
+                XCTAssertTrue(model.sidebarIsCollapsed)
+            }
+        }
+    }
+
+    @MainActor private static func splitView(in view: NSView) -> NSSplitView? {
+        if let split = view as? NSSplitView { return split }
+        return view.subviews.lazy.compactMap { splitView(in: $0) }.first
     }
 
     func testAnUnreadableFileLeavesTheOpenDraftAlone() async throws {

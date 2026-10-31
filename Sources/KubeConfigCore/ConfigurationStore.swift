@@ -22,6 +22,30 @@ public struct LocalFileAccess: FileAccess {
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
     }
 
+    /// Limits credential reads before allocating their contents, and never waits on a pipe or device.
+    public func read(_ url: URL, maximumByteCount: Int) throws -> Data? {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var information = stat()
+        guard Darwin.fstat(descriptor, &information) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard information.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EFTYPE) }
+        guard information.st_size <= maximumByteCount else { throw POSIXError(.EFBIG) }
+        var data = Data()
+        while data.count <= maximumByteCount {
+            let chunk = try handle.read(upToCount: min(64 * 1024, maximumByteCount - data.count + 1)) ?? Data()
+            if chunk.isEmpty { return data }
+            data.append(chunk)
+        }
+        throw POSIXError(.EFBIG)
+    }
+
     public func writeAtomically(_ data: Data, to url: URL) throws {
         try write(data, to: url, expected: nil)
     }

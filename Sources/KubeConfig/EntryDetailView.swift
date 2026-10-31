@@ -17,6 +17,8 @@ struct EntryDetailView: View {
                         GlassIconButton(title: isActive ? "Clear Active Context" : "Make Active", symbol: isActive ? "checkmark.circle.fill" : "checkmark.circle", isOn: isActive) {
                             if isActive { model.clearActive() } else { model.makeActive() }
                         }
+                        GlassIconButton(title: model.contextExportTitle, symbol: "square.and.arrow.up", action: model.requestContextExport)
+                            .disabled(!model.canExportContexts)
                     }
                     GlassIconButton(title: blockedReason ?? "Delete \(kind.singular.capitalized)", symbol: "trash") { model.deleteEntry() }
                         .disabled(blockedReason != nil)

@@ -44,6 +44,7 @@ private struct DraftCommands: Commands {
                 Button("Reload Configuration", action: model.reload).keyboardShortcut("r")
                 Divider()
                 Button("Import…") { model.showImportSource = true }.keyboardShortcut("i").disabled(!model.canImport)
+                Button("Export Selected Contexts…", action: model.requestContextExport).disabled(!model.canExportContexts)
                 Button("Export Draft…", action: model.exportDraft).keyboardShortcut("e", modifiers: [.command, .shift]).disabled(model.hasNoConfiguration)
             }.disabled(model.sheetIsOpen)
         }

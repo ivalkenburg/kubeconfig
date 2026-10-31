@@ -54,7 +54,25 @@ struct EntryEditor: Equatable {
 final class AppModel: ObservableObject {
     @Published var section: AppSection = .contexts
     @Published var selectedName: String?
-    @Published var search = ""
+    @Published private(set) var selectedContextNames: Set<String> = [] {
+        didSet { contextSelectionGeneration &+= 1 }
+    }
+    @Published var search = "" {
+        didSet {
+            guard search != oldValue else { return }
+            contextSelectionGeneration &+= 1
+            guard section == .contexts else { return }
+            let visible = Set(visibleEntries.map(\.name))
+            guard !selectedContextNames.isSubset(of: visible) else { return }
+            do {
+                try flushEditor()
+                applyContextSelection(selectedContextNames.intersection(visibleEntries.map(\.name)))
+            } catch {
+                search = oldValue
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
     @Published var editor: EntryEditor? { didSet { evaluation = nil } }
     @Published var document: KubeDocument? { didSet { evaluation = nil } }
     @Published var draftText = ""
@@ -76,18 +94,20 @@ final class AppModel: ObservableObject {
     @Published var records: [BackupSummary] = []
     @Published var damagedBackupCount = 0
     @Published var selectedBackupID: String?
-    @Published var columnVisibility: NavigationSplitViewVisibility = .all
+    @Published var columnVisibility: NavigationSplitViewVisibility {
+        didSet { defaults.set(sidebarIsCollapsed, forKey: Self.sidebarCollapsedKey) }
+    }
     /// Bumped to move focus to the list's search field.
     @Published var searchFocusRequest = 0
     @Published private(set) var recentFiles: [URL]
     @Published var showRaw = false {
-        // Two columns mean something else in each mode, so a collapsed sidebar has to be carried across.
-        didSet { if showRaw != oldValue, sidebarIsCollapsed(raw: oldValue) { columnVisibility = hiddenSidebarColumns } }
+        didSet { if showRaw != oldValue { contextSelectionGeneration &+= 1 } }
     }
     @Published var showReview = false
     @Published var showImport = false
     @Published var importPlan: ImportPlan?
     @Published var showImportSource = false
+    @Published private(set) var contextExportPlan: ContextExportPlan?
     @Published var wrapsYAML: Bool { didSet { defaults.set(wrapsYAML, forKey: Self.wrapsYAMLKey) } }
     @Published private var undoStack: [String] = []
     @Published private var redoStack: [String] = []
@@ -102,8 +122,10 @@ final class AppModel: ObservableObject {
     private var evaluation: (issues: [String], changes: DraftChanges?, reviewCount: Int)?
     /// The draft when YAML editing began. The whole session becomes one undo step.
     private var rawSessionStart: String?
+    private var contextSelectionGeneration: UInt64 = 0
     private static let historyLimit = 100
     private static let wrapsYAMLKey = "wrapsYAML"
+    private static let sidebarCollapsedKey = "sidebarCollapsed"
     private static let recentFilesKey = "recentConfigurations"
     private static let recentFilesLimit = 10
     weak var rawEditor: NSTextView?
@@ -119,6 +141,7 @@ final class AppModel: ObservableObject {
         defaults.register(defaults: [BackupRetention.key: BackupRetention.defaultCount,
                                      ContextSwitching.immediateKey: ContextSwitching.immediateByDefault])
         wrapsYAML = defaults.bool(forKey: Self.wrapsYAMLKey)
+        columnVisibility = defaults.bool(forKey: Self.sidebarCollapsedKey) ? .detailOnly : .all
         recentFiles = (defaults.stringArray(forKey: Self.recentFilesKey) ?? []).map(URL.init(fileURLWithPath:))
         do {
             let options = try LaunchOptions(arguments: arguments)
@@ -134,7 +157,15 @@ final class AppModel: ObservableObject {
     var formIsDirty: Bool { editor != loadedEditor }
     var hasPendingChanges: Bool { draftText != (snapshot?.text ?? "") || formIsDirty }
     var needsAttentionBeforeLeaving: Bool { hasPendingChanges || recoveryContents != nil }
-    var sheetIsOpen: Bool { showReview || showImportSource || showImport }
+    var sheetIsOpen: Bool { showReview || showImportSource || showImport || contextExportPlan != nil }
+    var hasMultipleContextSelection: Bool { section == .contexts && selectedContextNames.count > 1 }
+    var canExportContexts: Bool {
+        section == .contexts && !showRaw && document != nil && !selectedContextNames.isEmpty && !sheetIsOpen
+    }
+    var contextExportTitle: String {
+        let count = selectedContextNames.count
+        return count == 0 ? "Export Selected Contexts" : "Export \(count) Selected Context\(count == 1 ? "" : "s")"
+    }
     /// No file, or a blank one such as `touch ~/.kube/config` leaves, so there's nothing to edit yet.
     var hasNoConfiguration: Bool {
         snapshot.map { draftText == $0.text && $0.text.allSatisfy(\.isWhitespace) } ?? false
@@ -158,12 +189,8 @@ final class AppModel: ObservableObject {
     var draftStatus: String? { formIsDirty ? "Edited" : statusMessage ?? (hasPendingChanges ? "Edited" : nil) }
     func displayPath(_ url: URL) -> String { (url.path as NSString).abbreviatingWithTildeInPath }
     /// With the sidebar gone, the toolbar title takes over choosing the section.
-    var sidebarIsCollapsed: Bool { sidebarIsCollapsed(raw: showRaw) }
-    private func sidebarIsCollapsed(raw: Bool) -> Bool {
-        columnVisibility == .detailOnly || (!raw && columnVisibility == .doubleColumn)
-    }
-    private var hiddenSidebarColumns: NavigationSplitViewVisibility { showRaw ? .detailOnly : .doubleColumn }
-    func toggleSidebar() { columnVisibility = sidebarIsCollapsed ? .all : hiddenSidebarColumns }
+    var sidebarIsCollapsed: Bool { columnVisibility == .detailOnly }
+    func toggleSidebar() { columnVisibility = sidebarIsCollapsed ? .all : .detailOnly }
     private var hasRawSessionEdits: Bool { rawSessionStart.map { $0 != draftText } ?? false }
     private var evaluated: (issues: [String], changes: DraftChanges?, reviewCount: Int) {
         if let evaluation { return evaluation }
@@ -192,6 +219,7 @@ final class AppModel: ObservableObject {
     }
     /// Why an entry can't be deleted, for disabled buttons and menu items.
     func deleteBlockReason(_ name: String) -> String? {
+        guard !hasMultipleContextSelection else { return "Select a single context to delete" }
         guard let kind = section.kind, let document else { return "Nothing to delete" }
         let count = document.referencingContexts(kind, name: name).count
         return count == 0 ? nil : "Used by \(count) context\(count == 1 ? "" : "s")"
@@ -219,7 +247,7 @@ final class AppModel: ObservableObject {
             if loaded.exists { noteRecentFile(loaded.url) }
             draftText = loaded.text
             parseDraft()
-            clearEditor(); selectedName = nil; search = ""
+            clearEditor(); selectedName = nil; selectedContextNames = []; search = ""
             showRaw = false; statusMessage = nil; backupWarning = nil
             clearHistory()
             selectFirstEntry()
@@ -342,6 +370,10 @@ final class AppModel: ObservableObject {
 
     /// Selects `preferred`, or else keeps the current entry if it still exists.
     private func reselect(_ preferred: String? = nil) {
+        if preferred == nil, hasMultipleContextSelection {
+            let remaining = selectedContextNames.intersection(visibleEntries.map(\.name))
+            if !remaining.isEmpty { selectContexts(remaining); return }
+        }
         let current = selectedName.flatMap { name in section.kind.flatMap { document?.entry($0, named: name) }?.name }
         if let target = preferred ?? current { reveal(target) } else { selectFirstEntry() }
     }
@@ -370,8 +402,10 @@ final class AppModel: ObservableObject {
         try stage(next)
         let name = editor.name.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedName = name
+        if editor.kind == .contexts { selectedContextNames = [name] }
         self.editor = next.entry(editor.kind, named: name).map(EntryEditor.init)
         loadedEditor = self.editor
+        if editor.kind == .contexts, !visibleEntries.contains(where: { $0.name == name }) { search = "" }
         return true
     }
 
@@ -379,6 +413,7 @@ final class AppModel: ObservableObject {
         do {
             try flushEditor()
             endRawSession()
+            selectedContextNames = []
             section = next; search = ""; showRaw = false
             clearEditor(); selectedName = nil
             if next == .backups { refreshBackups() } else { selectFirstEntry() }
@@ -389,6 +424,7 @@ final class AppModel: ObservableObject {
         do {
             try flushEditor()
             selectedName = name
+            if section == .contexts { selectedContextNames = name.map { [$0] } ?? [] }
             if let kind = section.kind, let name, let entry = document?.entry(kind, named: name) {
                 editor = EntryEditor(entry)
                 loadedEditor = editor
@@ -397,6 +433,39 @@ final class AppModel: ObservableObject {
     }
 
     func selectFirstEntry() { selectEntry(visibleEntries.first?.name) }
+
+    /// AppKit can report selection during a SwiftUI update. Keep only the latest still-current request.
+    func queueContextSelection(_ names: Set<String>) {
+        contextSelectionGeneration &+= 1
+        let generation = contextSelectionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, generation == self.contextSelectionGeneration,
+                  self.section == .contexts, !self.showRaw, !self.sheetIsOpen else { return }
+            self.selectContexts(names)
+        }
+    }
+
+    func selectContexts(_ names: Set<String>) {
+        guard section == .contexts, names != selectedContextNames else { return }
+        do {
+            let originalName = editor?.originalName
+            try flushEditor()
+            var names = names
+            // A focus change can commit a rename while the list is still sending its old selection.
+            if let originalName, let renamed = editor?.originalName, originalName != renamed,
+               names.remove(originalName) != nil { names.insert(renamed) }
+            applyContextSelection(names.intersection(visibleEntries.map(\.name)))
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func applyContextSelection(_ names: Set<String>) {
+        selectedContextNames = names
+        selectedName = names.count == 1 ? names.first : nil
+        if !showRaw, let name = selectedName, let entry = document?.entry(.contexts, named: name) {
+            editor = EntryEditor(entry)
+            loadedEditor = editor
+        } else { clearEditor() }
+    }
 
     func createConfiguration() {
         do { try stage(.empty); selectFirstEntry() }
@@ -428,6 +497,7 @@ final class AppModel: ObservableObject {
     }
 
     func makeActive(_ name: String? = nil) {
+        guard !hasMultipleContextSelection else { return }
         do {
             guard let name = try flushed(name ?? selectedName) else { return }
             try switchContext(to: name, stagedMessage: "Context switch staged")
@@ -435,6 +505,7 @@ final class AppModel: ObservableObject {
     }
 
     func clearActive() {
+        guard !hasMultipleContextSelection else { return }
         do {
             try flushEditor()
             try switchContext(to: "", stagedMessage: "Active context cleared")
@@ -475,6 +546,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteEntry(_ requested: String? = nil) {
+        guard !hasMultipleContextSelection else { return }
         do {
             guard let kind = section.kind, let name = try flushed(requested ?? selectedName), var next = document else { return }
             if kind == .contexts && next.currentContext == name {
@@ -509,6 +581,7 @@ final class AppModel: ObservableObject {
     }
 
     func duplicateEntry(_ requested: String) {
+        guard !hasMultipleContextSelection else { return }
         do {
             guard let kind = section.kind, let name = try flushed(requested), var next = document else { return }
             let copy = try next.duplicate(kind, name: name)
@@ -653,7 +726,6 @@ final class AppModel: ObservableObject {
     /// Find for the whole app: the YAML editor's find bar, or else the list's search.
     func find() {
         if showRaw { performFind(.showFindInterface); return }
-        if columnVisibility == .detailOnly { columnVisibility = .doubleColumn }
         searchFocusRequest += 1
     }
 
@@ -678,6 +750,22 @@ final class AppModel: ObservableObject {
     func prepareImport(file url: URL) throws {
         guard let data = try LocalFileAccess().read(url), let yaml = String(data: data, encoding: .utf8) else { throw ConfigError.invalid("Choose a UTF-8 kubeconfig file.") }
         try prepareImport(yaml: yaml, directory: url.deletingLastPathComponent())
+    }
+
+    @discardableResult
+    func importDroppedFiles(_ urls: [URL]) -> Bool {
+        guard !sheetIsOpen, errorMessage == nil, window?.attachedSheet == nil else { return false }
+        guard urls.count == 1, let url = urls.first, url.isFileURL else {
+            errorMessage = "Drop one kubeconfig file at a time."
+            return false
+        }
+        do {
+            try prepareImport(file: url)
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func prepareImport(yaml: String, directory: URL?) throws {
@@ -740,6 +828,28 @@ final class AppModel: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    func requestContextExport() {
+        guard canExportContexts else { return }
+        do {
+            try flushEditor()
+            guard let document, let snapshot else { return }
+            let names = selectedContextNames.intersection(visibleEntries.map(\.name))
+            contextExportPlan = try ContextExportPlan(document: document, contextNames: names,
+                                                     sourceDirectory: snapshot.url.deletingLastPathComponent())
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func closeContextExport() { contextExportPlan = nil }
+
+    /// Saves exactly the reviewed snapshot, even if an external credential file has changed since preview.
+    func saveContextExport() throws {
+        guard let plan = contextExportPlan else { return }
+        if try export(Data(plan.yaml.utf8), title: "Export Selected Contexts", name: "kubeconfig-export.yaml",
+                      protecting: Array(plan.sourceFiles)) {
+            closeContextExport()
+        }
+    }
+
     func exportRecovery() {
         guard let recoveryContents else { return }
         do {
@@ -750,10 +860,16 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    private func export(_ data: Data, title: String, name: String) throws -> Bool {
+    private func export(_ data: Data, title: String, name: String, protecting sources: [URL] = []) throws -> Bool {
         guard let url = chooseExportURL(title, name) else { return false }
-        if url.standardizedFileURL.resolvingSymlinksInPath() == snapshot?.resolvedURL {
+        let destination = url.standardizedFileURL
+        let resolved = destination.resolvingSymlinksInPath()
+        let openFiles = [snapshot?.url, snapshot?.resolvedURL].compactMap { $0?.standardizedFileURL }
+        if openFiles.contains(where: { $0 == destination || $0.resolvingSymlinksInPath() == resolved }) {
             throw ConfigError.invalid("Export to a different file. Use Apply to update the open configuration.")
+        }
+        if sources.contains(where: { $0.standardizedFileURL == destination || $0.resolvingSymlinksInPath() == resolved }) {
+            throw ConfigError.invalid("Export to a different file. A referenced credential file cannot be replaced by the export.")
         }
         try LocalFileAccess().writeAtomically(data, to: url)
         return true

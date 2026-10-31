@@ -132,8 +132,8 @@ struct YAMLEditor: NSViewRepresentable {
 
         func detach() {
             model.rawEditor = nil
-            model.rawCanUndo = false
-            model.rawCanRedo = false
+            if model.rawCanUndo { model.rawCanUndo = false }
+            if model.rawCanRedo { model.rawCanRedo = false }
         }
 
         func undoManager(for view: NSTextView) -> UndoManager? { undo }

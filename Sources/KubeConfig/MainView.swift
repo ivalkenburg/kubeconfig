@@ -5,28 +5,38 @@ import SwiftUI
 struct MainView: View {
     @ObservedObject var model: AppModel
     @FocusState private var searchIsFocused: Bool
+    @State private var fileDropIsTargeted = false
 
     var body: some View {
-        Group {
-            if model.showRaw {
-                // The whole file is on screen, so the entry list has nothing to add.
-                NavigationSplitView(columnVisibility: $model.columnVisibility) {
-                    sidebar
-                } detail: {
-                    detail.toolbar { toolbarContent }
-                }
-            } else {
-                NavigationSplitView(columnVisibility: $model.columnVisibility) {
-                    sidebar
-                } content: {
+        // Keep the sidebar's split view alive when the editor changes modes.
+        NavigationSplitView(columnVisibility: $model.columnVisibility) {
+            sidebar
+        } detail: {
+            HSplitView {
+                if !model.showRaw {
                     contentList
-                        .navigationSplitViewColumnWidth(min: 235, ideal: 275, max: 370)
-                } detail: {
-                    detail.toolbar { toolbarContent }
+                        .frame(minWidth: 235, idealWidth: 275, maxWidth: 370)
                 }
+                detail.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .toolbar { toolbarContent }
         }
         .toolbar(removing: .title)
+        .dropDestination(for: URL.self) { urls, _ in
+            model.importDroppedFiles(urls)
+        } isTargeted: { targeted in
+            fileDropIsTargeted = targeted && !model.sheetIsOpen
+        }
+        .overlay {
+            if fileDropIsTargeted {
+                ZStack {
+                    Color(nsColor: .windowBackgroundColor).opacity(0.92)
+                    Label("Drop one kubeconfig to review its import", systemImage: "square.and.arrow.down")
+                        .font(.title2).padding(24)
+                }
+                .allowsHitTesting(false)
+            }
+        }
         .onChange(of: model.searchFocusRequest) { searchIsFocused = true }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.checkForExternalChange()
@@ -35,6 +45,9 @@ struct MainView: View {
         .sheet(isPresented: $model.showImportSource) { ImportSourceSheet(model: model) }
         .sheet(isPresented: $model.showImport) {
             if let plan = model.importPlan { ImportSheet(model: model, initialPlan: plan) }
+        }
+        .sheet(isPresented: Binding(get: { model.contextExportPlan != nil }, set: { if !$0 { model.closeContextExport() } })) {
+            if let plan = model.contextExportPlan { ContextExportSheet(model: model, plan: plan) }
         }
         .alert("Couldn’t complete the action", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK") {}
@@ -144,17 +157,28 @@ struct MainView: View {
                 }
             }
         } else {
-            List(selection: Binding<String?>(get: { model.selectedName }, set: { if $0 != model.selectedName { model.selectEntry($0) } })) {
-                ForEach(entries) { entry in
-                    EntryRow(entry: entry, active: isActive(entry), changed: isChanged(entry, in: changes))
-                        .tag(entry.name)
-                        .padding(.vertical, 5)
+            Group {
+                if kind == .contexts {
+                    List(selection: Binding(get: { model.selectedContextNames }, set: model.queueContextSelection)) {
+                        entryRows(entries, changes: changes)
+                    }
+                } else {
+                    List(selection: Binding<String?>(get: { model.selectedName }, set: { if $0 != model.selectedName { model.selectEntry($0) } })) {
+                        entryRows(entries, changes: changes)
+                    }
                 }
             }
             .contextMenu(forSelectionType: String.self) { names in
-                if let entry = entries.first(where: { names.contains($0.name) }) { entryMenu(entry) }
+                if kind == .contexts, names.count > 1 || model.hasMultipleContextSelection {
+                    Button(model.contextExportTitle, action: model.requestContextExport).disabled(!model.canExportContexts)
+                    Divider()
+                    Button("Make Active") {}.disabled(true)
+                    Button("Duplicate") {}.disabled(true)
+                    Button("Delete", role: .destructive) {}.disabled(true)
+                } else if let entry = entries.first(where: { names.contains($0.name) }) { entryMenu(entry) }
             } primaryAction: { names in
-                if let entry = entries.first(where: { names.contains($0.name) }), entry.kind == .contexts, !isActive(entry) {
+                if names.count == 1, !model.hasMultipleContextSelection,
+                   let entry = entries.first(where: { names.contains($0.name) }), entry.kind == .contexts, !isActive(entry) {
                     model.makeActive(entry.name)
                 }
             }
@@ -162,6 +186,14 @@ struct MainView: View {
             .onDeleteCommand {
                 if let name = model.selectedName, model.deleteBlockReason(name) == nil { model.deleteEntry(name) } else { NSSound.beep() }
             }
+        }
+    }
+
+    private func entryRows(_ entries: [ConfigEntry], changes: DraftChanges?) -> some View {
+        ForEach(entries) { entry in
+            EntryRow(entry: entry, active: isActive(entry), changed: isChanged(entry, in: changes))
+                .tag(entry.name)
+                .padding(.vertical, 5)
         }
     }
 
@@ -282,6 +314,8 @@ struct MainView: View {
                         Button("Open YAML Editor", action: model.toggleRawEditor).buttonStyle(.borderedProminent)
                         Button("Open Another File…", action: model.openConfiguration)
                     }
+                } else if model.hasMultipleContextSelection {
+                    ContextSelectionSummary(model: model)
                 } else if model.editor != nil {
                     EntryDetailView(model: model)
                 } else {
@@ -302,6 +336,7 @@ struct MainView: View {
 private struct FileTitle: View {
     @ObservedObject var model: AppModel
     @State private var showIssues = false
+    @State private var titleIsHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -328,10 +363,19 @@ private struct FileTitle: View {
                 Divider()
                 sectionToggle(.backups)
             } label: {
-                Text(model.section.title).font(.headline)
+                HStack(spacing: 4) {
+                    Text(model.section.title).font(.headline)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .opacity(titleIsHovered ? 1 : 0)
+                        .accessibilityHidden(true)
+                }
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
             .fixedSize()
+            .onHover { titleIsHovered = $0 }
         } else {
             Text(model.section.title).font(.headline).lineLimit(1)
         }

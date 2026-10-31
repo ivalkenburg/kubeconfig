@@ -61,8 +61,28 @@ import KubeConfigCore
                 model.refreshBackups()
             }
             model.selectSection(.contexts)
-            model.columnVisibility = .doubleColumn
+            model.selectContexts(["development", "production-eu"])
+            await shot("contexts-multiple")
+            window.setContentSize(NSSize(width: 920, height: 600))
+            await shot("contexts-multiple-compact")
+            model.requestContextExport()
+            await sheetShot("context-export", after: 500)
+            model.closeContextExport()
+            await wait(500)
+            setAppearance(.darkAqua)
+            model.requestContextExport()
+            await sheetShot("context-export-dark", after: 500)
+            model.closeContextExport()
+            await wait(500)
+            setAppearance(.aqua)
+            window.setContentSize(NSSize(width: 1120, height: 740))
+            model.selectEntry("development")
+            model.columnVisibility = .detailOnly
             await shot("sidebar-collapsed", after: 500)
+            model.toggleRawEditor()
+            await shot("yaml-sidebar-collapsed", after: 500)
+            model.toggleRawEditor()
+            await shot("forms-sidebar-collapsed", after: 500)
             model.columnVisibility = .all
             await wait(500)
             model.editor?.fields["namespace"] = "preview-namespace"
