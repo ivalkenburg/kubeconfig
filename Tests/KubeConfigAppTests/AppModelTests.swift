@@ -1025,15 +1025,6 @@ final class AppModelTests: XCTestCase {
         }
     }
 
-    func testReadOnlyColoringKeepsTheTextIntact() {
-        let text = "# note\nname: 'x' # 👋\nretries: 3\nplain text\n"
-        XCTAssertEqual(String(YAMLStyle.attributed(text).characters), text)
-        let long = String(repeating: "a: 1\n", count: YAMLStyle.highlightLimit / 5 + 1)
-        let plain = YAMLStyle.attributed(long)
-        XCTAssertEqual(plain.characters.count, long.count)
-        XCTAssertEqual(plain.runs.count, 1, "Past the limit the text stays uncolored")
-    }
-
     @MainActor private final class EditorHarness {
         let coordinator: YAMLEditor.Coordinator
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))

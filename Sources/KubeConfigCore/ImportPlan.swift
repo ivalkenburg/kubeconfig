@@ -5,14 +5,13 @@ public enum ImportAction {
     case rename, replace, skip, reuse
 }
 
-public struct ImportItem: Identifiable {
+public struct ImportItem {
     public let kind: EntryKind
     public let originalName: String
     public let conflicts: Bool
     public let identical: Bool
     public var action: ImportAction
     public var destinationName: String
-    public var id: String { kind.rawValue + ":" + originalName }
 }
 
 public struct ImportPlan {
