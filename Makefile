@@ -5,11 +5,11 @@ SIGN_FLAGS ?= --timestamp=none
 
 ifeq ($(CONFIG),debug)
 APP := KubeConfig Dev
-BUNDLE_ID := local.kubeconfig.app.dev
+BUNDLE_ID := com.igorv.kubeconfig.dev
 OUTPUT_DIR := build/debug
 else ifeq ($(CONFIG),release)
 APP := KubeConfig
-BUNDLE_ID := local.kubeconfig.app
+BUNDLE_ID := com.igorv.kubeconfig
 OUTPUT_DIR := build
 else
 $(error CONFIG must be debug or release)
@@ -20,7 +20,10 @@ STAGING_DIR := $(OUTPUT_DIR)/.bundle-$(CONFIG)
 STAGING_BUNDLE := $(STAGING_DIR)/$(APP).app
 ICON := build/AppIcon.icns
 
-.PHONY: all help build debug dev production bundle run install install-dev install-production install-prod test clean
+VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+DMG := build/KubeConfig-$(VERSION).dmg
+
+.PHONY: all help build debug dev production bundle run install install-dev install-production install-prod test dmg cask clean
 
 all: bundle
 
@@ -33,6 +36,8 @@ help:
 	  'make install-production     Install KubeConfig.app' \
 	  'make install CONFIG=debug   Equivalent development install' \
 	  'make test                   Run the test suite' \
+	  'make dmg                    Build build/KubeConfig-<version>.dmg (release)' \
+	  'make cask                   Write build/kubeconfig.rb for the Homebrew tap' \
 	  'Override INSTALL_DIR or IDENTITY when needed.'
 
 build:
@@ -109,6 +114,31 @@ install-production install-prod:
 
 test:
 	swift test
+
+# A disk image with an Applications link to drag onto, always from the release app.
+# Pass IDENTITY and SIGN_FLAGS to sign it for publishing.
+dmg:
+	@$(MAKE) bundle CONFIG=release
+	@rm -rf build/dmg "$(DMG)"
+	@mkdir -p build/dmg
+	@ditto "build/KubeConfig.app" build/dmg/KubeConfig.app
+	@ln -s /Applications build/dmg/Applications
+	@# `diskutil image` replaces the deprecated `hdiutil create` but is new in macOS 26.
+	@if diskutil image create from --help >/dev/null 2>&1; then \
+	  diskutil image create from --format UDZO --volumeName "KubeConfig" build/dmg "$(DMG)" >/dev/null; \
+	else \
+	  hdiutil create -volname "KubeConfig" -srcfolder build/dmg -format UDZO -ov "$(DMG)" >/dev/null; \
+	fi
+	@rm -rf build/dmg
+	@printf 'Built %s\n' "$(DMG)"
+
+# Fills the cask template with this version and the disk image's checksum.
+cask:
+	@test -f "$(DMG)" || { echo "$(DMG) not found; run make dmg first"; exit 1; }
+	@sed -e '1{/^#/d;}' -e 's/^  version ".*"/  version "$(VERSION)"/' \
+	     -e "s/^  sha256 \".*\"/  sha256 \"$$(shasum -a 256 "$(DMG)" | cut -d' ' -f1)\"/" \
+	     packaging/kubeconfig.rb > build/kubeconfig.rb
+	@echo "wrote build/kubeconfig.rb"
 
 clean:
 	swift package clean
