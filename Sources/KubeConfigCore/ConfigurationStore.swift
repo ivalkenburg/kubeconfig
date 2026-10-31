@@ -59,8 +59,30 @@ public struct FileSnapshot: Equatable {
     public let url: URL
     public let resolvedURL: URL
     public let data: Data?
-    public var text: String { data.flatMap { String(data: $0, encoding: .utf8) } ?? "" }
+    /// Stored, because the app compares it with the draft several times per view update.
+    public let text: String
     public var exists: Bool { data != nil }
+
+    init(url: URL, resolvedURL: URL, data: Data?) {
+        self.url = url
+        self.resolvedURL = resolvedURL
+        self.data = data
+        text = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
+}
+
+/// What a backup list shows. It's saved beside each backup, so that listing never reads file contents.
+public struct BackupSummary: Codable, Identifiable, Equatable {
+    public let id: String
+    public let configurationPath: String
+    public let createdAt: Date
+    public let byteCount: Int
+}
+
+public struct BackupListing: Equatable {
+    public var records: [BackupSummary] = []
+    /// Files that failed their checks. They stay in the folder, left out of `records`.
+    public var damagedCount = 0
 }
 
 public struct BackupRecord: Codable, Identifiable, Equatable {
@@ -69,10 +91,12 @@ public struct BackupRecord: Codable, Identifiable, Equatable {
     public let createdAt: Date
     public let contents: Data
     public let checksum: String
-    public var byteCount: Int { contents.count }
+    public var summary: BackupSummary {
+        BackupSummary(id: id, configurationPath: configurationPath, createdAt: createdAt, byteCount: contents.count)
+    }
 
-    public init(configurationPath: String, contents: Data, createdAt: Date = Date(), id: String = UUID().uuidString) {
-        self.id = id
+    public init(configurationPath: String, contents: Data, createdAt: Date = Date()) {
+        id = UUID().uuidString
         self.configurationPath = configurationPath
         self.createdAt = createdAt
         self.contents = contents
@@ -102,21 +126,57 @@ public struct BackupStore {
         directory.appendingPathComponent(BackupRecord.hash(Data(configuration.standardizedFileURL.path.utf8)), isDirectory: true)
     }
 
-    public func records(for configuration: URL) throws -> [BackupRecord] {
+    public func records(for configuration: URL) throws -> BackupListing {
         let folder = location(for: configuration)
-        guard FileManager.default.fileExists(atPath: folder.path) else { return [] }
+        var listing = BackupListing()
+        guard FileManager.default.fileExists(atPath: folder.path) else { return listing }
         let urls = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-        let records = try urls.map { url -> BackupRecord in
-            guard let data = try files.read(url), let record = try? JSONDecoder().decode(BackupRecord.self, from: data),
-                  record.configurationPath == configuration.standardizedFileURL.path,
-                  BackupRecord.hash(record.contents) == record.checksum,
-                  record.id == url.deletingPathExtension().lastPathComponent else {
-                throw ConfigError.backupFailure("A backup is damaged or belongs to another configuration. Reveal the backup folder to inspect it.")
-            }
-            return record
+        for url in urls {
+            if let summary = savedSummary(of: url, for: configuration) ?? rebuiltSummary(of: url, for: configuration) {
+                listing.records.append(summary)
+            } else { listing.damagedCount += 1 }
         }
-        return records.sorted { $0.createdAt == $1.createdAt ? $0.id > $1.id : $0.createdAt > $1.createdAt }
+        listing.records.sort { $0.createdAt == $1.createdAt ? $0.id > $1.id : $0.createdAt > $1.createdAt }
+        return listing
+    }
+
+    /// Reads a listed backup in full. A summary says nothing about its file, so this is where damage shows up.
+    public func record(_ summary: BackupSummary, for configuration: URL) throws -> BackupRecord {
+        try verifiedRecord(at: location(for: configuration).appendingPathComponent(summary.id + ".json"), for: configuration)
+    }
+
+    public func remove(_ summary: BackupSummary, for configuration: URL) throws {
+        let url = location(for: configuration).appendingPathComponent(summary.id + ".json")
+        try FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: summaryURL(of: url))
+    }
+
+    private func summaryURL(of url: URL) -> URL { url.deletingPathExtension().appendingPathExtension("meta") }
+
+    private func savedSummary(of url: URL, for configuration: URL) -> BackupSummary? {
+        guard let data = try? files.read(summaryURL(of: url)),
+              let summary = try? JSONDecoder().decode(BackupSummary.self, from: data),
+              summary.configurationPath == configuration.standardizedFileURL.path,
+              summary.id == url.deletingPathExtension().lastPathComponent else { return nil }
+        return summary
+    }
+
+    /// Covers backups saved before summaries existed, and summaries that were lost.
+    private func rebuiltSummary(of url: URL, for configuration: URL) -> BackupSummary? {
+        guard let record = try? verifiedRecord(at: url, for: configuration) else { return nil }
+        try? files.writeAtomically(JSONEncoder().encode(record.summary), to: summaryURL(of: url))
+        return record.summary
+    }
+
+    private func verifiedRecord(at url: URL, for configuration: URL) throws -> BackupRecord {
+        guard let data = try files.read(url), let record = try? JSONDecoder().decode(BackupRecord.self, from: data),
+              record.configurationPath == configuration.standardizedFileURL.path,
+              BackupRecord.hash(record.contents) == record.checksum,
+              record.id == url.deletingPathExtension().lastPathComponent else {
+            throw ConfigError.backupFailure("This backup is damaged or belongs to another configuration. Reveal the backup folder to inspect it.")
+        }
+        return record
     }
 
     /// Called only after the destination was successfully replaced.
@@ -135,15 +195,14 @@ public struct BackupStore {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-            try files.writeAtomically(JSONEncoder().encode(record), to: folder.appendingPathComponent(record.id + ".json"))
+            let url = folder.appendingPathComponent(record.id + ".json")
+            try files.writeAtomically(JSONEncoder().encode(record), to: url)
+            try? files.writeAtomically(JSONEncoder().encode(record.summary), to: summaryURL(of: url))
             saved = record
         }
-        try prune(for: configuration, keeping: retention)
+        // The backup is safe by now.
+        try? prune(for: configuration, keeping: retention)
         return saved
-    }
-
-    public func rollbackDocument(_ record: BackupRecord, for configuration: URL) throws -> KubeDocument {
-        try KubeDocument(yaml: rollbackText(record, for: configuration))
     }
 
     public func rollbackText(_ record: BackupRecord, for configuration: URL) throws -> String {
@@ -155,9 +214,10 @@ public struct BackupStore {
         return text
     }
 
+    /// A damaged backup stays for inspection, so each one is verified before it goes.
     private func prune(for configuration: URL, keeping retention: Int) throws {
-        for record in try records(for: configuration).dropFirst(retention) {
-            try FileManager.default.removeItem(at: location(for: configuration).appendingPathComponent(record.id + ".json"))
+        for summary in try records(for: configuration).records.dropFirst(retention) where (try? record(summary, for: configuration)) != nil {
+            try remove(summary, for: configuration)
         }
     }
 }
@@ -181,15 +241,22 @@ public struct ConfigurationStore {
 
     public func load(_ url: URL) throws -> FileSnapshot {
         let logical = url.standardizedFileURL
-        let resolved = logical.resolvingSymlinksInPath()
+        let resolved = Self.resolved(logical)
         let data = try files.read(resolved)
         if let data, String(data: data, encoding: .utf8) == nil { throw ConfigError.invalid("The configuration must be UTF-8 text.") }
         return FileSnapshot(url: logical, resolvedURL: resolved, data: data)
     }
 
     public func hasChanged(_ snapshot: FileSnapshot) throws -> Bool {
-        if snapshot.url.resolvingSymlinksInPath() != snapshot.resolvedURL { return true }
+        if Self.resolved(snapshot.url) != snapshot.resolvedURL { return true }
         return try files.read(snapshot.resolvedURL) != snapshot.data
+    }
+
+    /// `resolvingSymlinksInPath` stops at a dangling link, and writing there would replace the link.
+    private static func resolved(_ url: URL) -> URL {
+        let path = url.resolvingSymlinksInPath()
+        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: path.path) else { return path }
+        return URL(fileURLWithPath: target, relativeTo: path.deletingLastPathComponent()).absoluteURL.standardizedFileURL
     }
 
     public func apply(_ document: KubeDocument, over snapshot: FileSnapshot, retention: Int) throws -> ApplyResult {
@@ -210,5 +277,15 @@ public struct ConfigurationStore {
                                warning: "Configuration applied, but its backup could not be saved. Export the previous contents now to keep an undo point.",
                                recoveryContents: snapshot.data)
         }
+    }
+
+    /// Writes only the active context, with no backup, since switching back undoes it.
+    /// Returns nil when the file can't take the patch, leaving the switch to go through Apply.
+    public func switchContext(to name: String, over snapshot: FileSnapshot) throws -> FileSnapshot? {
+        guard let text = KubeDocument.settingCurrentContext(name, in: snapshot.text) else { return nil }
+        let data = Data(text.utf8)
+        if data == snapshot.data { return snapshot }
+        try files.replaceIfUnchanged(data, at: snapshot.resolvedURL, expectedContents: snapshot.data)
+        return FileSnapshot(url: snapshot.url, resolvedURL: snapshot.resolvedURL, data: data)
     }
 }

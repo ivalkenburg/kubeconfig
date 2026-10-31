@@ -1,6 +1,5 @@
 #if DEBUG
 import AppKit
-import Foundation
 import KubeConfigCore
 
 /// Captures the real native view using an explicitly supplied sample file, never the user's kubeconfig.
@@ -14,71 +13,104 @@ import KubeConfigCore
         started = true
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1))
-            guard let window = NSApplication.shared.windows.first(where: { $0.isVisible && $0.title == "KubeConfig" }) else {
-                NSApplication.shared.terminate(nil); return
+            func wait(_ milliseconds: Int) async { try? await Task.sleep(for: .milliseconds(milliseconds)) }
+            await wait(1000)
+            guard let window = model.window else { NSApplication.shared.terminate(nil); return }
+            @MainActor func setAppearance(_ name: NSAppearance.Name) {
+                NSApp.appearance = NSAppearance(named: name)
+                window.appearance = NSAppearance(named: name)
             }
-            NSApp.appearance = NSAppearance(named: .aqua)
-            window.appearance = NSAppearance(named: .aqua)
+            @MainActor func shot(_ name: String, after milliseconds: Int = 300) async {
+                await wait(milliseconds)
+                save(window, to: folder.appendingPathComponent("\(name).png"))
+            }
+            @MainActor func sheetShot(_ name: String, after milliseconds: Int) async {
+                await wait(milliseconds)
+                if let sheet = window.attachedSheet { save(sheet, to: folder.appendingPathComponent("\(name).png")) }
+            }
+            NSApp.activate()
+            window.makeKeyAndOrderFront(nil)
+            setAppearance(.aqua)
             window.setContentSize(NSSize(width: 1120, height: 740))
-            try? await Task.sleep(for: .milliseconds(400))
-            save(window, to: folder.appendingPathComponent("contexts-light.png"))
-            NSApp.appearance = NSAppearance(named: .darkAqua)
-            window.appearance = NSAppearance(named: .darkAqua)
-            try? await Task.sleep(for: .milliseconds(400))
-            save(window, to: folder.appendingPathComponent("contexts-dark.png"))
-            NSApp.appearance = NSAppearance(named: .aqua)
-            window.appearance = NSAppearance(named: .aqua)
+            await shot("contexts-light", after: 400)
+            setAppearance(.darkAqua)
+            await shot("contexts-dark", after: 400)
+            setAppearance(.aqua)
             window.setContentSize(NSSize(width: 920, height: 600))
-            try? await Task.sleep(for: .milliseconds(400))
-            save(window, to: folder.appendingPathComponent("contexts-compact.png"))
+            await shot("contexts-compact", after: 400)
             window.setContentSize(NSSize(width: 1120, height: 740))
             model.selectSection(.clusters)
-            try? await Task.sleep(for: .milliseconds(300))
-            save(window, to: folder.appendingPathComponent("cluster.png"))
+            await shot("cluster")
             model.selectSection(.users)
-            try? await Task.sleep(for: .milliseconds(300))
-            save(window, to: folder.appendingPathComponent("user.png"))
+            await shot("user")
             model.selectSection(.backups)
-            try? await Task.sleep(for: .milliseconds(300))
-            save(window, to: folder.appendingPathComponent("backups.png"))
-            if let snapshot = model.snapshot, let data = snapshot.data {
-                let exampleBackup = BackupRecord(configurationPath: snapshot.resolvedURL.path, contents: data)
-                model.records = [exampleBackup]
-                model.selectedBackupID = exampleBackup.id
-                try? await Task.sleep(for: .milliseconds(300))
-                save(window, to: folder.appendingPathComponent("backup-rollback.png"))
+            await shot("backups")
+            if let snapshot = model.snapshot, let data = snapshot.data,
+               let example = try? model.store.backups.savePrevious(data, for: snapshot.resolvedURL, retention: BackupRetention.range.upperBound) {
+                model.refreshBackups()
+                model.selectedBackupID = example.id
+                await shot("backup-rollback")
+                model.wrapsYAML = true
+                await shot("backup-wrapped")
+                model.wrapsYAML = false
+                await wait(300)
                 model.search = "no-matching-backup"
-                try? await Task.sleep(for: .milliseconds(300))
-                save(window, to: folder.appendingPathComponent("backup-search-empty.png"))
+                await shot("backup-search-empty")
                 model.search = ""
+                try? model.store.backups.remove(example.summary, for: snapshot.resolvedURL)
+                model.refreshBackups()
             }
             model.selectSection(.contexts)
+            model.columnVisibility = .doubleColumn
+            await shot("sidebar-collapsed", after: 500)
+            model.columnVisibility = .all
+            await wait(500)
             model.editor?.fields["namespace"] = "preview-namespace"
             _ = try? model.flushEditor()
+            await shot("contexts-pending")
+            model.showRaw = true
+            await shot("yaml", after: 500)
+            model.wrapsYAML = true
+            await shot("yaml-wrapped", after: 400)
+            model.wrapsYAML = false
+            model.showRaw = false
+            await wait(300)
+            model.addEntry()
+            model.editor?.fields["cluster"] = ""
+            model.commitForm()
+            await shot("issues", after: 400)
+            model.deleteEntry()
+            model.showImportSource = true
+            await sheetShot("import-source", after: 500)
+            model.showImportSource = false
+            await wait(500)
+            model.selectEntry("production-eu")
+            // Staged directly, since Make Active could write to the file.
+            if var next = model.document {
+                try? next.setCurrentContext("production-eu")
+                try? model.stage(next, message: "Context switch staged")
+            }
             model.requestReview()
-            try? await Task.sleep(for: .milliseconds(500))
-            if let sheet = window.attachedSheet { save(sheet, to: folder.appendingPathComponent("review-diff.png")) }
+            await sheetShot("review-diff", after: 1000)
             model.cancelReview()
-            try? await Task.sleep(for: .milliseconds(400))
+            await wait(400)
             let imported = (model.snapshot?.text ?? "").replacingOccurrences(of: "dev.example.invalid", with: "imported.example.invalid")
             try? model.prepareImport(yaml: imported, directory: model.snapshot?.url.deletingLastPathComponent())
-            try? await Task.sleep(for: .milliseconds(500))
-            if let sheet = window.attachedSheet { save(sheet, to: folder.appendingPathComponent("import.png")) }
-            model.showImport = false; model.importPlan = nil
+            await sheetShot("import", after: 500)
+            model.closeImport()
             model.discardDraft()
-            try? await Task.sleep(for: .milliseconds(300))
+            await wait(300)
             NSApplication.shared.terminate(nil)
         }
     }
 
+    /// Uses the window server, since cacheDisplay can't draw the Liquid Glass sidebar.
     private static func save(_ window: NSWindow, to url: URL) {
-        guard let view = window.contentView?.superview else { return }
-        view.layoutSubtreeIfNeeded()
-        view.displayIfNeeded()
-        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: bitmap)
-        if let data = bitmap.representation(using: .png, properties: [:]) { try? data.write(to: url) }
+        let capture = Process()
+        capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        capture.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", url.path]
+        try? capture.run()
+        capture.waitUntilExit()
     }
 }
 #endif

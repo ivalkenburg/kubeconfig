@@ -8,9 +8,9 @@ final class BackupTests: FileTestCase {
             _ = try backups.savePrevious(Data("version-\(number)".utf8), for: config, retention: 3, now: Date(timeIntervalSince1970: Double(number)))
         }
         _ = try backups.savePrevious(Data("other-file".utf8), for: other, retention: 3)
-        let records = try backups.records(for: config)
-        XCTAssertEqual(records.map { String(data: $0.contents, encoding: .utf8)! }, ["version-6", "version-5", "version-4"])
-        XCTAssertEqual(try backups.records(for: other).count, 1)
+        let records = try backups.records(for: config).records
+        XCTAssertEqual(try records.map { String(data: try backups.record($0, for: config).contents, encoding: .utf8)! }, ["version-6", "version-5", "version-4"])
+        XCTAssertEqual(try backups.records(for: other).records.count, 1)
     }
 
     func testReducedRetentionTakesEffectOnNextSuccessfulApply() throws {
@@ -19,21 +19,22 @@ final class BackupTests: FileTestCase {
         for namespace in ["one", "two", "three", "four"] {
             snapshot = try store.apply(Fixtures.changed(namespace: namespace), over: snapshot, retention: 10).snapshot
         }
-        XCTAssertEqual(try backups.records(for: config).count, 4)
+        XCTAssertEqual(try backups.records(for: config).records.count, 4)
         _ = try store.apply(Fixtures.changed(namespace: "five"), over: snapshot, retention: 2)
-        let records = try backups.records(for: config)
+        let records = try backups.records(for: config).records
         XCTAssertEqual(records.count, 2)
-        let namespaces = try records.map { try backups.rollbackDocument($0, for: config).entry(.contexts, named: "development")!.value("namespace") }
+        let namespaces = try records.map { try KubeDocument(yaml: backups.rollbackText(backups.record($0, for: config), for: config)).entry(.contexts, named: "development")!.value("namespace") }
         XCTAssertEqual(namespaces, ["four", "three"])
     }
 
     func testZeroDisablesBackupsAndPrunesAfterApply() throws {
         try writeInitial()
         let first = try store.apply(Fixtures.changed(namespace: "one"), over: store.load(config), retention: 10)
-        XCTAssertEqual(try backups.records(for: config).count, 1)
+        XCTAssertEqual(try backups.records(for: config).records.count, 1)
         let second = try store.apply(Fixtures.changed(namespace: "two"), over: first.snapshot, retention: 0)
         XCTAssertNil(second.backup)
-        XCTAssertTrue(try backups.records(for: config).isEmpty)
+        XCTAssertTrue(try backups.records(for: config).records.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: backups.location(for: config).path), [])
         XCTAssertEqual(try KubeDocument(yaml: diskText()).entry(.contexts, named: "development")!.value("namespace"), "two")
     }
 
@@ -41,12 +42,12 @@ final class BackupTests: FileTestCase {
         try writeInitial()
         let first = try store.apply(Fixtures.changed(namespace: "changed"), over: store.load(config), retention: 10)
         let backup = try XCTUnwrap(first.backup)
-        let rollback = try backups.rollbackDocument(backup, for: config)
+        let rollback = try KubeDocument(yaml: backups.rollbackText(backup, for: config))
         XCTAssertEqual(rollback, try Fixtures.document())
         XCTAssertEqual(try KubeDocument(yaml: diskText()), try Fixtures.changed(namespace: "changed"))
         let restored = try store.apply(rollback, over: first.snapshot, retention: 10)
         XCTAssertEqual(try KubeDocument(yaml: diskText()), try Fixtures.document())
-        let undoRollback = try backups.rollbackDocument(XCTUnwrap(restored.backup), for: config)
+        let undoRollback = try KubeDocument(yaml: backups.rollbackText(XCTUnwrap(restored.backup), for: config))
         XCTAssertEqual(undoRollback, try Fixtures.changed(namespace: "changed"))
         _ = try store.apply(undoRollback, over: restored.snapshot, retention: 10)
         XCTAssertEqual(try KubeDocument(yaml: diskText()), try Fixtures.changed(namespace: "changed"))
@@ -54,7 +55,7 @@ final class BackupTests: FileTestCase {
 
     func testRollbackRejectsBackupForAnotherFile() throws {
         let record = BackupRecord(configurationPath: config.path, contents: Data(Fixtures.yaml.utf8))
-        XCTAssertThrowsError(try backups.rollbackDocument(record, for: directory.appendingPathComponent("different")))
+        XCTAssertThrowsError(try backups.rollbackText(record, for: directory.appendingPathComponent("different")))
     }
 
     func testCorruptBackupCannotBeUsedOrSilentlyPruned() throws {
@@ -63,9 +64,61 @@ final class BackupTests: FileTestCase {
         var json = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
         json["contents"] = Data("tampered".utf8).base64EncodedString()
         try JSONSerialization.data(withJSONObject: json).write(to: url)
-        XCTAssertThrowsError(try backups.records(for: config))
-        XCTAssertThrowsError(try backups.savePrevious(nil, for: config, retention: 0))
+        XCTAssertThrowsError(try backups.record(record.summary, for: config))
+        XCTAssertNoThrow(try backups.savePrevious(nil, for: config, retention: 0))
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testDamagedBackupIsCountedAndTheOthersStayListed() throws {
+        let kept = try XCTUnwrap(backups.savePrevious(Data("kept".utf8), for: config, retention: 10))
+        let damaged = backups.location(for: config).appendingPathComponent("damaged.json")
+        try Data("garbage".utf8).write(to: damaged)
+        let listing = try backups.records(for: config)
+        XCTAssertEqual(listing.records, [kept.summary])
+        XCTAssertEqual(listing.damagedCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: damaged.path))
+    }
+
+    func testListingNeverReadsBackupContents() throws {
+        let files = RecordingFiles()
+        let store = BackupStore(directory: directory.appendingPathComponent("recorded"), files: files)
+        let record = try XCTUnwrap(store.savePrevious(Data("text".utf8), for: config, retention: 10))
+        files.reads = []
+        XCTAssertEqual(try store.records(for: config).records, [record.summary])
+        XCTAssertEqual(files.reads.map(\.pathExtension), ["meta"])
+    }
+
+    func testBackupsWithoutASummaryGetOneWhenListed() throws {
+        let record = try XCTUnwrap(backups.savePrevious(Data("text".utf8), for: config, retention: 10))
+        let summary = backups.location(for: config).appendingPathComponent(record.id + ".meta")
+        try FileManager.default.removeItem(at: summary)
+        XCTAssertEqual(try backups.records(for: config).records, [record.summary])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: summary.path))
+    }
+
+    func testBackupsFromTheSameInstantHaveAStableOrder() throws {
+        let instant = Date(timeIntervalSince1970: 1_000)
+        for number in 0..<4 { _ = try backups.savePrevious(Data("\(number)".utf8), for: config, retention: 10, now: instant) }
+        let ids = try backups.records(for: config).records.map(\.id)
+        XCTAssertEqual(ids, ids.sorted(by: >))
+    }
+
+    func testRollbackRejectsTamperedAndNonUTF8Contents() throws {
+        let binary = BackupRecord(configurationPath: config.path, contents: Data([0xFF, 0xFE]))
+        XCTAssertThrowsError(try backups.rollbackText(binary, for: config))
+        let json = try JSONEncoder().encode(BackupRecord(configurationPath: config.path, contents: Data("original".utf8)))
+        let tampered = String(decoding: json, as: UTF8.self).replacingOccurrences(of: Data("original".utf8).base64EncodedString(), with: Data("tampered".utf8).base64EncodedString())
+        let record = try JSONDecoder().decode(BackupRecord.self, from: Data(tampered.utf8))
+        XCTAssertThrowsError(try backups.rollbackText(record, for: config))
+    }
+
+    func testRecordsRejectABackupFiledUnderTheWrongConfiguration() throws {
+        let other = directory.appendingPathComponent("other")
+        let record = try XCTUnwrap(backups.savePrevious(Data("text".utf8), for: other, retention: 10))
+        let folder = backups.location(for: config)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: backups.location(for: other).appendingPathComponent(record.id + ".json"), to: folder.appendingPathComponent(record.id + ".json"))
+        XCTAssertEqual(try backups.records(for: config), BackupListing(records: [], damagedCount: 1))
     }
 
     func testNegativeRetentionIsRejectedWithoutChangingConfiguration() throws {
@@ -73,4 +126,10 @@ final class BackupTests: FileTestCase {
         XCTAssertThrowsError(try store.apply(Fixtures.changed(), over: store.load(config), retention: -1))
         XCTAssertEqual(try diskText(), Fixtures.yaml)
     }
+}
+
+private final class RecordingFiles: FileAccess {
+    var reads: [URL] = []
+    func read(_ url: URL) throws -> Data? { reads.append(url); return try LocalFileAccess().read(url) }
+    func writeAtomically(_ data: Data, to url: URL) throws { try LocalFileAccess().writeAtomically(data, to: url) }
 }

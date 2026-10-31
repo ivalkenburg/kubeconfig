@@ -24,24 +24,25 @@ One file at a time, initially ~/.kube/config. Alternate files can be opened. No 
 
 ## Capabilities and Constraints
 
-- Searchable contexts, clusters, users, and backups. Selecting a context does not activate it.
-- Stage all changes and review a diff before Apply. Prompt on closing with pending changes; quit when the last window closes.
-- Focused forms and an explicitly revealed raw YAML editor. Preserve all values, unknown fields, and extensions; comments and formatting may change.
+- Searchable contexts, clusters, users, and backups. Selecting a context does not activate it; double-click, Return, or Make Active does.
+- Context switches go straight to the file by default, skipping Apply, review, Undo, and backups, and changing only `current-context`. Pending edits stay in the draft. A preference stages switches instead. Contexts not yet on disk and files that can't take the single-value change are staged either way.
+- Stage all changes and step through a diff before Apply. Undo and Redo step through staged actions until Apply; Discard is one undoable step. Prompt on closing with pending changes; quit when the last window closes.
+- Focused forms and a syntax-highlighted raw YAML editor, one toggle away. Preserve all values, unknown fields, and extensions; comments and formatting may change.
 - File and pasted-YAML import with preview, Rename/Replace/Skip choices, reuse of identical entries, updated references, and rebased file paths. Relative paths in pasted YAML require a source folder.
-- Rename updates references. Block deletion of referenced users/clusters. Active-context deletion requires replacement or explicit clearing.
-- Reject invalid configurations and external modification conflicts. Allow exporting the draft before reload.
+- Rename updates references. Block deletion of referenced users/clusters, and say why before the attempt. Deletes are staged and undoable, so only active-context deletion confirms, offering to clear the active context.
+- Reject invalid configurations and external modification conflicts. Notice outside changes when the app comes forward, leaving Reload to the user. Allow exporting the draft before reload.
 - After a successful Apply, save the previous contents as an undo point. Rolling backups per file, default 10, configurable including zero. Trim on the next successful Apply.
 - Rollback stages a backup; Apply reviews and commits it, backing up the replaced configuration.
-- Mask recognized secrets in forms and diffs, with Reveal. Raw YAML exposes real contents. Never log credentials.
-- Offer Create/Import for a missing file and raw repair with locations for invalid YAML.
+- Credentials are always visible. Never log them.
+- Offer Create/Import for a missing or empty file and raw repair with locations for invalid YAML.
 
 ## Brand Commitments
 
-Name: KubeConfig. Standard macOS controls, system typography, compact spacing, and automatic light/dark appearance. Generate the icon using an image model: a blue hexagonal cluster motif with a white configuration-sliders symbol.
+Name: KubeConfig. Standard macOS controls with Liquid Glass chrome, system typography, compact spacing, and automatic light/dark appearance. Generate the icon using an image model: a blue hexagonal cluster motif with a white configuration-sliders symbol.
 
 ## Product Principles
 
-- Disk changes are explicit, reviewable, and recoverable.
+- Disk changes are explicit, reviewable, and recoverable. The one exception is an immediate context switch, which is explicit and reversed by switching back.
 - Preserve unfamiliar configuration rather than reconstructing only recognized fields.
 - Keep ordinary jobs quick and advanced editing accessible.
 - Test configuration mutations and backup/rollback behavior using isolated files.

@@ -4,106 +4,116 @@ import SwiftUI
 
 struct MainView: View {
     @ObservedObject var model: AppModel
+    @FocusState private var searchIsFocused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            NavigationSplitView {
-                sidebar
-                    .navigationSplitViewColumnWidth(min: 155, ideal: 180, max: 220)
-            } content: {
-                contentList
-                    .navigationSplitViewColumnWidth(min: 235, ideal: 275, max: 370)
-            } detail: {
-                detail
-            }
-            Divider()
-            footer
-        }
-        .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                Button(action: model.openConfiguration) { Label("Open", systemImage: "folder") }
-                    .help("Open a different kubeconfig (⌘O)")
-                Menu {
-                    Button("Import File…", action: model.importFile)
-                    Button("Paste YAML…") { model.showPaste = true }
-                } label: { Label("Import", systemImage: "square.and.arrow.down") }
-                .disabled(model.document == nil && !model.missingFile)
-            }
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button(action: model.revealRawEditor) {
-                    Label(model.showRaw ? "Forms" : "YAML", systemImage: model.showRaw ? "list.bullet.rectangle" : "chevron.left.forwardslash.chevron.right")
+        Group {
+            if model.showRaw {
+                // The whole file is on screen, so the entry list has nothing to add.
+                NavigationSplitView(columnVisibility: $model.columnVisibility) {
+                    sidebar
+                } detail: {
+                    detail.toolbar { toolbarContent }
                 }
-                .help("Edit the complete configuration as YAML")
-                .disabled(model.missingFile)
-                Button { model.requestReview() } label: { Label("Apply…", systemImage: "checkmark") }
-                    .buttonStyle(.borderedProminent)
-                    .labelStyle(.titleAndIcon)
-                    .disabled(!model.hasPendingChanges)
-                    .help("Review changes and apply them to disk (⌘S)")
+            } else {
+                NavigationSplitView(columnVisibility: $model.columnVisibility) {
+                    sidebar
+                } content: {
+                    contentList
+                        .navigationSplitViewColumnWidth(min: 235, ideal: 275, max: 370)
+                } detail: {
+                    detail.toolbar { toolbarContent }
+                }
             }
+        }
+        .toolbar(removing: .title)
+        .onChange(of: model.searchFocusRequest) { searchIsFocused = true }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.checkForExternalChange()
         }
         .sheet(isPresented: $model.showReview) { ReviewSheet(model: model) }
-        .sheet(isPresented: $model.showPaste) { PasteSheet(model: model) }
+        .sheet(isPresented: $model.showImportSource) { ImportSourceSheet(model: model) }
         .sheet(isPresented: $model.showImport) {
             if let plan = model.importPlan { ImportSheet(model: model, initialPlan: plan) }
         }
         .alert("Couldn’t complete the action", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
-            Button("OK") { model.errorMessage = nil }
+            Button("OK") {}
         } message: { Text(model.errorMessage ?? "") }
     }
 
-    private var sidebar: some View {
-        VStack(spacing: 0) {
-            List(selection: Binding<AppSection?>(get: { model.section }, set: { if let next = $0, next != model.section { model.selectSection(next) } })) {
-                Section("Configuration") {
-                    ForEach([AppSection.contexts, .clusters, .users]) { section in
-                        Label {
-                            Text(section.title)
-                        } icon: {
-                            Image(systemName: section.symbol)
-                                .foregroundStyle(model.section == section ? Color.white : Color.primary)
-                        }.tag(section)
-                    }
-                }
-                Section("History") {
-                    Label {
-                        Text("Backups")
-                    } icon: {
-                        Image(systemName: AppSection.backups.symbol)
-                            .foregroundStyle(model.section == .backups ? Color.white : Color.primary)
-                    }.tag(AppSection.backups)
-                }
+    @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .navigation) { FileTitle(model: model) }
+            .sharedBackgroundVisibility(.hidden)
+        ToolbarSpacer(.flexible, placement: .navigation)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button(action: model.openConfiguration) { Label("Open", systemImage: "folder") }
+                .help("Open a different kubeconfig (⌘O)")
+            Button { model.showImportSource = true } label: { Label("Import", systemImage: "square.and.arrow.down") }
+                .help("Merge another kubeconfig into this draft (⌘I)")
+                .disabled(!model.canImport)
+            Button(action: model.toggleRawEditor) {
+                Label(model.showRaw ? "Forms" : "YAML", systemImage: model.showRaw ? "list.bullet.rectangle" : "chevron.left.forwardslash.chevron.right")
             }
-            .listStyle(.sidebar)
-            VStack(alignment: .leading, spacing: 9) {
-                Label("Active context", systemImage: "checkmark.circle")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text(model.appliedContext.isEmpty ? "None selected" : model.appliedContext)
-                    .font(.system(.subheadline, weight: .medium))
-                    .lineLimit(2).textSelection(.enabled)
-                if model.document?.currentContext != model.appliedContext, model.document != nil {
-                    Text("Switch pending Apply").font(.caption).foregroundStyle(.orange)
-                }
+            .help(model.showRaw ? "Return to the forms" : "Edit the complete configuration as YAML")
+            .disabled(model.hasNoConfiguration && !model.showRaw)
+            if model.showRaw {
+                Toggle(isOn: $model.wrapsYAML) { Label("Wrap Lines", systemImage: "arrow.turn.down.left") }
+                    .help("Wrap long lines")
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-            Divider()
-            HStack {
-                SettingsLink { Label("Preferences", systemImage: "gearshape") }
-                    .buttonStyle(.plain).font(.caption)
-                Spacer()
-            }.padding(16)
         }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button(action: model.undoCommand) { Label("Undo", systemImage: "arrow.uturn.backward") }
+                .help("Undo (⌘Z)")
+                .disabled(!model.canUndo)
+            Button(action: model.redoCommand) { Label("Redo", systemImage: "arrow.uturn.forward") }
+                .help("Redo (⇧⌘Z)")
+                .disabled(!model.canRedoCommand)
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
+            Button(action: model.discardDraft) { Text("Discard").padding(.horizontal, 6) }
+                .help("Discard all pending changes. Undo brings them back.")
+                .disabled(!model.hasPendingChanges)
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Button { model.requestReview() } label: {
+                Label(applyTitle, systemImage: "checkmark").labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.glassProminent)
+            .disabled(!model.canApply)
+            .help(model.validationIssues.isEmpty ? "Review changes and apply them to disk (⌘S)" : "Fix the configuration issues before applying")
+        }
+    }
+
+    private var applyTitle: String {
+        model.reviewCount > 0 ? "Apply \(model.reviewCount)" : "Apply"
+    }
+
+    private var sidebar: some View {
+        let changes = model.pendingChanges
+        return List(selection: Binding<AppSection?>(get: { model.section }, set: { if let next = $0, next != model.section { model.selectSection(next) } })) {
+            Section("Configuration") {
+                ForEach(AppSection.configuration) { section in
+                    Label(section.title, systemImage: section.symbol)
+                        .badge(section.kind.flatMap { changes?.count($0) } ?? 0)
+                        .tag(section)
+                }
+            }
+            Section("History") {
+                Label("Backups", systemImage: AppSection.backups.symbol).tag(AppSection.backups)
+            }
+        }
+        .listStyle(.sidebar)
         .navigationTitle("KubeConfig")
+        .navigationSplitViewColumnWidth(min: 155, ideal: 180, max: 220)
     }
 
     private var contentList: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(model.section.title).font(.headline)
-                Spacer()
+            HStack(spacing: 6) {
+                searchField
                 if let kind = model.section.kind {
-                    Text("\(model.document?.entries(kind).count ?? 0)").font(.caption).foregroundStyle(.secondary)
                     Button(action: model.addEntry) { Image(systemName: "plus") }
                         .buttonStyle(.borderless)
                         .help("Add \(kind.singular)")
@@ -113,84 +123,122 @@ struct MainView: View {
                     Button(action: model.refreshBackups) { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Refresh backups").accessibilityLabel("Refresh backups")
                 }
-            }.padding(.horizontal, 16).padding(.vertical, 13)
-            Divider()
-            if model.section == .backups {
-                backupList
+            }.padding(10)
+            if let kind = model.section.kind {
+                entryList(kind)
             } else {
-                entryList
+                backupList
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
-    private var entryList: some View {
-        VStack(spacing: 0) {
-            searchField
-            if model.visibleEntries.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: model.search.isEmpty ? model.section.symbol : "magnifyingglass")
-                        .font(.title2).foregroundStyle(.secondary)
-                    Text(model.search.isEmpty ? "No \(model.section.title.lowercased()) yet" : "No matches")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                    if model.search.isEmpty, model.document != nil {
-                        Button("Add \(model.section.kind!.singular)", action: model.addEntry)
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(selection: Binding<String?>(get: { model.selectedName }, set: { if $0 != model.selectedName { model.selectEntry($0) } })) {
-                    ForEach(model.visibleEntries) { entry in
-                        EntryRow(entry: entry, active: model.document?.currentContext == entry.name && entry.kind == .contexts)
-                            .tag(entry.name)
-                            .padding(.vertical, 5)
-                    }
-                }.listStyle(.inset)
+    @ViewBuilder private func entryList(_ kind: EntryKind) -> some View {
+        let changes = model.pendingChanges
+        let entries = model.visibleEntries
+        if entries.isEmpty {
+            ListMessage(symbol: model.search.isEmpty ? kind.symbol : "magnifyingglass",
+                        title: model.search.isEmpty ? "No \(kind.title.lowercased()) yet" : "No matches") {
+                if model.search.isEmpty, model.document != nil {
+                    Button("Add \(kind.singular)", action: model.addEntry)
+                }
+            }
+        } else {
+            List(selection: Binding<String?>(get: { model.selectedName }, set: { if $0 != model.selectedName { model.selectEntry($0) } })) {
+                ForEach(entries) { entry in
+                    EntryRow(entry: entry, active: isActive(entry), changed: isChanged(entry, in: changes))
+                        .tag(entry.name)
+                        .padding(.vertical, 5)
+                }
+            }
+            .contextMenu(forSelectionType: String.self) { names in
+                if let entry = entries.first(where: { names.contains($0.name) }) { entryMenu(entry) }
+            } primaryAction: { names in
+                if let entry = entries.first(where: { names.contains($0.name) }), entry.kind == .contexts, !isActive(entry) {
+                    model.makeActive(entry.name)
+                }
+            }
+            .listStyle(.inset)
+            .onDeleteCommand {
+                if let name = model.selectedName, model.deleteBlockReason(name) == nil { model.deleteEntry(name) } else { NSSound.beep() }
             }
         }
     }
 
-    private var backupList: some View {
-        VStack(spacing: 0) {
-            searchField
-            if model.records.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "clock.arrow.circlepath").font(.title2).foregroundStyle(.secondary)
-                    Text("No backups yet").font(.subheadline)
-                    Text("After Apply, the previous version appears here.")
-                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.visibleBackups.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass").font(.title2).foregroundStyle(.secondary)
-                    Text("No matching backups").font(.subheadline)
-                    Text("Try another date or clear your search.")
-                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Button("Clear Search") { model.search = "" }
-                }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
+    private func isActive(_ entry: ConfigEntry) -> Bool {
+        entry.kind == .contexts && model.document?.currentContext == entry.name
+    }
+
+    private func isChanged(_ entry: ConfigEntry, in changes: DraftChanges?) -> Bool {
+        changes?.contains(entry.kind, name: entry.name) == true || (isActive(entry) && changes?.activeContextChanged == true)
+    }
+
+    @ViewBuilder private func entryMenu(_ entry: ConfigEntry) -> some View {
+        if entry.kind == .contexts {
+            if isActive(entry) {
+                Button("Clear Active Context", action: model.clearActive)
             } else {
-                List(model.visibleBackups, selection: $model.selectedBackupID) { record in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(record.createdAt, format: .dateTime.month(.abbreviated).day().hour().minute().second())
-                            .font(.system(.body, weight: .medium))
-                        Text(ByteCountFormatter.string(fromByteCount: Int64(record.byteCount), countStyle: .file))
-                            .font(.caption).foregroundStyle(.secondary)
-                    }.padding(.vertical, 6).tag(record.id)
-                }.listStyle(.inset)
+                Button("Make Active") { model.makeActive(entry.name) }
             }
+            Divider()
+        }
+        Button("Duplicate") { model.duplicateEntry(entry.name) }
+        Button("Copy Name") { model.copyToPasteboard(entry.name) }
+        if entry.kind == .clusters {
+            Button("Copy Server URL") { model.copyToPasteboard(entry.value("server")) }
+                .disabled(entry.value("server").isEmpty)
+        }
+        Divider()
+        let blocked = model.deleteBlockReason(entry.name)
+        Button(blocked.map { "Delete (\($0.lowercased()))" } ?? (isActive(entry) ? "Delete…" : "Delete"), role: .destructive) {
+            model.deleteEntry(entry.name)
+        }
+        .disabled(blocked != nil)
+    }
+
+    @ViewBuilder private var backupList: some View {
+        let backups = model.visibleBackups
+        if model.records.isEmpty {
+            ListMessage(symbol: AppSection.backups.symbol, title: "No backups yet", detail: "After Apply, the previous version appears here.")
+        } else if backups.isEmpty {
+            ListMessage(symbol: "magnifyingglass", title: "No matching backups", detail: "Try another date or clear your search.") {
+                Button("Clear Search") { model.search = "" }
+            }
+        } else {
+            List(backups, selection: $model.selectedBackupID) { record in
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(record.createdAt, format: .backupDate)
+                        .font(.system(.body, weight: .medium))
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(record.byteCount), countStyle: .file))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 6).tag(record.id)
+                .contextMenu {
+                    Button("Rollback…") { model.selectedBackupID = record.id; model.rollbackSelected() }
+                    Button("Reveal in Finder", action: model.revealBackups)
+                }
+            }.listStyle(.inset)
         }
     }
 
     private var searchField: some View {
-        HStack(spacing: 7) {
+        let label = "Search \(model.section.title.lowercased())"
+        return HStack(spacing: 7) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField(model.section == .backups ? "Search backups by date" : "Search \(model.section.title.lowercased())", text: $model.search)
+            TextField(model.section == .backups ? "Search by date" : label, text: $model.search)
                 .textFieldStyle(.plain)
-                .accessibilityLabel("Search \(model.section.title.lowercased())")
+                .focused($searchIsFocused)
+                .accessibilityLabel(label)
             if !model.search.isEmpty {
                 Button { model.search = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear search")
             }
-        }.padding(9).background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 7)).padding(10)
+        }.padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary.opacity(0.5), in: Capsule())
+    }
+
+    private var emptyStateProblem: String {
+        let path = model.snapshot?.url.path ?? "the selected path"
+        return model.snapshot?.exists == true ? "\(path) is empty." : "There’s no file at \(path)."
     }
 
     @ViewBuilder private var detail: some View {
@@ -200,73 +248,125 @@ struct MainView: View {
                     if model.recoveryContents != nil { Button("Export Previous…", action: model.exportRecovery) }
                 }
             }
-            if model.showRaw {
-                RawEditorView(model: model)
-            } else if model.section == .backups {
-                BackupDetailView(model: model)
-            } else if model.missingFile {
-                ContentUnavailableView {
-                    Label("Create your configuration", systemImage: "doc.badge.plus")
-                } description: {
-                    Text("There’s no file at \(model.snapshot?.url.path ?? "the selected path"). Create one or import a kubeconfig to get started.")
-                } actions: {
-                    Button("Create Configuration", action: model.createConfiguration).buttonStyle(.borderedProminent)
-                    Button("Import File…", action: model.importFile)
-                }
-            } else if model.parseIssue != nil {
-                ContentUnavailableView {
-                    Label("This file needs repair", systemImage: "doc.badge.exclamationmark")
-                } description: { Text(model.parseIssue ?? "") } actions: {
-                    Button("Open YAML Editor", action: model.revealRawEditor).buttonStyle(.borderedProminent)
-                    Button("Open Another File…", action: model.openConfiguration)
-                }
-            } else if model.editor != nil {
-                EntryDetailView(model: model)
-            } else {
-                ContentUnavailableView {
-                    Label("Select a \(model.section.kind?.singular ?? "configuration")", systemImage: model.section.symbol)
-                } description: {
-                    Text("Choose an entry to edit, add one, or import a kubeconfig.")
+            if model.fileChangedOnDisk {
+                NoticeBar(symbol: "exclamationmark.triangle", text: "This file changed outside KubeConfig. Reload to see the new version.", tint: .orange) {
+                    if model.hasPendingChanges { Button("Export Draft…", action: model.exportDraft) }
+                    Button("Reload", action: model.reload)
                 }
             }
+            if model.section == .backups, model.damagedBackupCount > 0 {
+                let count = model.damagedBackupCount
+                NoticeBar(symbol: "exclamationmark.triangle", text: "\(count) damaged backup\(count == 1 ? " isn’t" : "s aren’t") listed.", tint: .orange) {
+                    Button("Reveal Folder", action: model.revealBackups)
+                }
+            }
+            // Fills the rest, so that an unavailable view can't let the stack above it drift to the middle.
+            Group {
+                if model.showRaw {
+                    YAMLEditor(model: model)
+                } else if model.section == .backups {
+                    BackupDetailView(model: model)
+                } else if model.hasNoConfiguration {
+                    ContentUnavailableView {
+                        Label("Create your configuration", systemImage: "doc.badge.plus")
+                    } description: {
+                        Text("\(emptyStateProblem) Create a configuration or import a kubeconfig to get started.")
+                    } actions: {
+                        Button("Create Configuration", action: model.createConfiguration).buttonStyle(.borderedProminent)
+                        Button("Import…") { model.showImportSource = true }
+                    }
+                } else if model.parseIssue != nil {
+                    ContentUnavailableView {
+                        Label("This file needs repair", systemImage: "exclamationmark.triangle")
+                    } description: { Text(model.parseIssue ?? "") } actions: {
+                        Button("Open YAML Editor", action: model.toggleRawEditor).buttonStyle(.borderedProminent)
+                        Button("Open Another File…", action: model.openConfiguration)
+                    }
+                } else if model.editor != nil {
+                    EntryDetailView(model: model)
+                } else {
+                    ContentUnavailableView {
+                        Label("Select a \(model.section.kind?.singular ?? "configuration")", systemImage: model.section.symbol)
+                    } description: {
+                        Text("Choose an entry to edit, add one, or import a kubeconfig.")
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }
+}
 
-    private var footer: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "doc.text").foregroundStyle(.secondary)
-            Text(model.snapshot?.url.path ?? "No configuration open")
-                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                .help(model.snapshot?.url.path ?? "")
-            Spacer(minLength: 10)
-            if !model.validationIssues.isEmpty {
-                Label("\(model.validationIssues.count) issue\(model.validationIssues.count == 1 ? "" : "s")", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(.orange).help(model.validationIssues.joined(separator: "\n"))
-            }
-            if model.hasPendingChanges {
-                Label("Pending changes", systemImage: "circle.fill").foregroundStyle(.orange)
-                Menu {
-                    Button("Export Draft…", action: model.exportDraft)
-                    Button("Reload from Disk…", action: model.reload)
-                    Button("Discard Changes…") { model.resolvePendingChanges {} }
-                } label: { Image(systemName: "ellipsis.circle") }
-                .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("Draft actions")
-            } else {
-                Label(model.statusMessage ?? "Up to date", systemImage: "checkmark.circle")
-                    .foregroundStyle(.secondary).lineLimit(1)
-            }
+private struct FileTitle: View {
+    @ObservedObject var model: AppModel
+    @State private var showIssues = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            sectionTitle
+            HStack(spacing: 4) {
+                Text(model.filePath).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                if let status = model.draftStatus { Text("· \(status)").foregroundStyle(.secondary).fixedSize() }
+                if !model.validationIssues.isEmpty { issuesButton.fixedSize() }
+            }.font(.caption)
         }
-        .font(.caption)
-        .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(.bar)
+        // Stays over the list column, which is 235 to 370 wide.
+        .frame(maxWidth: 260, alignment: .leading)
+        .padding(.leading, 6)
+        .help(model.snapshot?.url.path ?? "")
+        .contextMenu {
+            if let path = model.snapshot?.url.path { Button("Copy Path") { model.copyToPasteboard(path) } }
+        }
+    }
+
+    @ViewBuilder private var sectionTitle: some View {
+        if model.sidebarIsCollapsed {
+            Menu {
+                ForEach(AppSection.configuration) { sectionToggle($0) }
+                Divider()
+                sectionToggle(.backups)
+            } label: {
+                Text(model.section.title).font(.headline)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        } else {
+            Text(model.section.title).font(.headline).lineLimit(1)
+        }
+    }
+
+    private func sectionToggle(_ section: AppSection) -> some View {
+        Toggle(section.title, isOn: Binding(get: { model.section == section }, set: { _ in
+            if section != model.section { model.selectSection(section) }
+        }))
+    }
+
+    private var issuesButton: some View {
+        let count = model.validationIssues.count
+        return Button { showIssues.toggle() } label: {
+            Text("· \(count) issue\(count == 1 ? "" : "s")")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.orange)
+        .help("Show configuration issues")
+        .popover(isPresented: $showIssues, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(model.validationIssues, id: \.self) { issue in
+                    Label(issue, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(14).frame(width: 320, alignment: .leading)
+        }
     }
 }
 
 private struct EntryRow: View {
     let entry: ConfigEntry
     let active: Bool
+    let changed: Bool
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: entry.kind.symbol).foregroundStyle(active ? Color.accentColor : .secondary).padding(.top, 2)
@@ -274,7 +374,8 @@ private struct EntryRow: View {
                 HStack {
                     Text(entry.name).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
-                    if active { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor).help("Active in draft").accessibilityLabel("Active in draft") }
+                    if changed { ChangeDot() }
+                    if active { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor).help("Active in Draft").accessibilityLabel("Active in Draft") }
                 }
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
@@ -282,9 +383,67 @@ private struct EntryRow: View {
     }
     private var subtitle: String {
         switch entry.kind {
-        case .contexts: return entry.value("cluster") + " · " + (entry.value("namespace").isEmpty ? "default" : entry.value("namespace"))
+        case .contexts:
+            let cluster = entry.value("cluster"), namespace = entry.value("namespace")
+            return (cluster.isEmpty ? "No cluster" : cluster) + " · " + (namespace.isEmpty ? "default" : namespace)
         case .clusters: return entry.value("server").isEmpty ? "Server address required" : entry.value("server")
         case .users: return entry.authenticationSummary
+        }
+    }
+}
+
+/// Stands in for a list with nothing to show.
+private struct ListMessage<Actions: View>: View {
+    let symbol: String
+    let title: String
+    var detail: String?
+    @ViewBuilder var actions: Actions
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: symbol).font(.title2).foregroundStyle(.secondary)
+            Text(title).font(.subheadline).foregroundStyle(detail == nil ? .secondary : .primary)
+            if let detail {
+                Text(detail).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            actions
+        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+extension ListMessage where Actions == EmptyView {
+    init(symbol: String, title: String, detail: String? = nil) {
+        self.init(symbol: symbol, title: title, detail: detail) { EmptyView() }
+    }
+}
+
+struct ChangeDot: View {
+    var body: some View {
+        Circle().fill(.orange).frame(width: 6, height: 6)
+            .help("Changed since the file on disk")
+            .accessibilityLabel("Changed")
+    }
+}
+
+struct GlassIconButton: View {
+    let title: String
+    let symbol: String
+    var isOn = false
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).foregroundStyle(isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.foreground))
+        }
+        .buttonStyle(.glass).buttonBorderShape(.circle)
+        .help(title).accessibilityLabel(title)
+    }
+}
+
+struct GlassIconGroup<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        GlassEffectContainer(spacing: 6) {
+            HStack(spacing: 6) { content }
         }
     }
 }
@@ -292,12 +451,13 @@ private struct EntryRow: View {
 struct NoticeBar<Actions: View>: View {
     let symbol: String
     let text: String
-    var tint: Color = .accentColor
+    let tint: Color
     @ViewBuilder var actions: Actions
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: symbol).foregroundStyle(tint)
-            Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+            // A fixed height here would have the window measure this wrapped at its narrowest, and overflow.
+            Text(text).font(.callout)
             Spacer(minLength: 4)
             actions
         }

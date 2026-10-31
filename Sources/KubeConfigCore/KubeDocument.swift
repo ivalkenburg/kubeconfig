@@ -3,26 +3,40 @@ import Yams
 
 public enum ConfigError: LocalizedError, Equatable {
     case invalid(String)
+    case syntax(line: Int, column: Int)
+    case duplicateKey(String, line: Int)
     case externalChange
     case missingEntry(String)
     case referenced(String, [String])
-    case activeContext
     case backupFailure(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalid(let message): return message
+        case .syntax(let line, let column): return "Invalid YAML at line \(line), column \(column). Check indentation, quotes, and brackets."
+        case .duplicateKey(let key, let line): return "The key ‘\(key)’ is repeated in one mapping, first at line \(line). Remove the extra copy."
         case .externalChange: return "This file changed outside KubeConfig. Export your draft if needed, then reload the file before applying."
         case .missingEntry(let name): return "The entry ‘\(name)’ no longer exists."
         case .referenced(let name, let contexts): return "‘\(name)’ is used by: \(contexts.joined(separator: ", ")). Update or delete those contexts first."
-        case .activeContext: return "Choose another active context or explicitly clear the active context before deleting this one."
         case .backupFailure(let message): return message
+        }
+    }
+
+    /// The one-based line to mark in the YAML editor, when the problem has one.
+    public var line: Int? {
+        switch self {
+        case .syntax(let line, _), .duplicateKey(_, let line): return line
+        default: return nil
         }
     }
 }
 
-public enum EntryKind: String, CaseIterable, Identifiable, Codable {
+public enum EntryKind: String, CaseIterable, Identifiable {
     case contexts, clusters, users
+    /// The kinds a context refers to by name.
+    public static let referenced: [EntryKind] = [.clusters, .users]
+    /// Clusters and users come first, so that contexts can pick up their new names.
+    public static let importOrder: [EntryKind] = referenced + [.contexts]
     public var id: String { rawValue }
     public var title: String { rawValue.capitalized }
     public var singular: String { String(rawValue.dropLast()) }
@@ -40,38 +54,45 @@ public struct ConfigEntry: Identifiable, Equatable {
     public internal(set) var node: Node
     public var name: String { node["name"]?.string ?? "" }
     public var id: String { name }
-    public var fields: Node { node[kind.singular] ?? Node([] as [(Node, Node)]) }
-    public func value(_ key: String) -> String { fields[key]?.string ?? "" }
+    public var fields: Node { node[kind.singular] ?? .emptyMapping }
+    public func value(_ key: String) -> String { fields[key]?.text ?? "" }
     public var authenticationSummary: String {
-        if fields["exec"] != nil { return "Credential plugin" }
-        if fields["auth-provider"] != nil { return "Authentication provider" }
-        if fields["token"] != nil || fields["tokenFile"] != nil { return "Token" }
-        if fields["client-certificate"] != nil || fields["client-certificate-data"] != nil { return "Client certificate" }
-        if fields["username"] != nil { return "Username & password" }
+        let fields = fields
+        func has(_ key: String) -> Bool { fields[key].map { $0.tag != Tag(.null) } ?? false }
+        if has("exec") { return "Credential plugin" }
+        if has("auth-provider") { return "Authentication provider" }
+        if has("token") || has("tokenFile") { return "Token" }
+        if has("client-certificate") || has("client-certificate-data") { return "Client certificate" }
+        if has("username") { return "Username & password" }
         return "No credentials"
     }
 }
 
 public struct KubeDocument: Equatable {
     public static let maximumByteCount = 16 * 1024 * 1024
+    /// Counts aliases at every use, since a short file of nested aliases can otherwise expand without end.
+    private static let maximumNodeCount = 1_000_000
     public internal(set) var root: Node
 
     public init(yaml: String) throws {
         try Self.checkSize(yaml)
         do {
             guard let parsed = try Yams.compose(yaml: yaml), parsed.mapping != nil else {
-                throw ConfigError.invalid("A kubeconfig must be a YAML mapping. Create a configuration or import an existing one.")
+                throw ConfigError.invalid("A kubeconfig must be a YAML mapping.")
             }
             root = parsed
         } catch let error as YamlError {
             // Yams' default description includes source lines, which may contain credentials.
             switch error {
             case .scanner(_, _, let mark, _), .parser(_, _, let mark, _), .composer(_, _, let mark, _):
-                throw ConfigError.invalid("Invalid YAML at line \(mark.line), column \(mark.column). Check indentation, quotes, and brackets.")
+                throw ConfigError.syntax(line: mark.line, column: mark.column)
+            case .duplicatedKeysInMapping(let duplicates, let context):
+                throw ConfigError.duplicateKey(duplicates.first ?? "", line: context.mark.line)
             default: throw ConfigError.invalid("Could not parse the YAML. Check its encoding and syntax.")
             }
         }
-        try Self.checkMappings(root, path: "configuration", depth: 0)
+        var nodeCount = 0
+        try Self.checkMappings(root, depth: 0, nodeCount: &nodeCount)
         for kind in EntryKind.allCases {
             guard let node = root[kind.rawValue], node.null == nil else { continue }
             guard node.sequence != nil else { throw ConfigError.invalid("\(kind.title) must be a YAML list.") }
@@ -88,7 +109,7 @@ public struct KubeDocument: Equatable {
 
     public static let empty = try! KubeDocument(yaml: "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\ncurrent-context: \"\"\n")
 
-    public var currentContext: String { root["current-context"]?.string ?? "" }
+    public var currentContext: String { root["current-context"]?.text ?? "" }
 
     public func entries(_ kind: EntryKind) -> [ConfigEntry] {
         (root[kind.rawValue]?.array() ?? []).map { ConfigEntry(kind: kind, node: $0) }
@@ -98,14 +119,10 @@ public struct KubeDocument: Equatable {
         entries(kind).first { $0.name == name }
     }
 
-    public func serialized(revealingSecrets: Bool = true) throws -> String {
-        let text = try Yams.serialize(node: revealingSecrets ? root : Self.redacted(root), width: -1, allowUnicode: true)
-        if revealingSecrets { try Self.checkSize(text) }
+    public func serialized() throws -> String {
+        let text = try Yams.serialize(node: root, width: -1, allowUnicode: true)
+        try Self.checkSize(text)
         return text
-    }
-
-    internal func redactedComparedTo(_ previous: KubeDocument?) throws -> String {
-        try Yams.serialize(node: Self.redacted(root, comparedTo: previous?.root), width: -1, allowUnicode: true)
     }
 
     public var validationIssues: [String] {
@@ -116,8 +133,7 @@ public struct KubeDocument: Equatable {
             issues.append("current-context must be a string.")
         }
         for cluster in entries(.clusters) {
-            let server = cluster.value("server")
-            if let url = URL(string: server), ["https", "http"].contains(url.scheme ?? ""), url.host != nil {} else {
+            if !Self.isServerAddress(cluster.value("server")) {
                 issues.append("Cluster ‘\(cluster.name)’ needs a valid http or https server address.")
             }
             issues += Self.stringFieldIssues(cluster, keys: ["server", "certificate-authority", "certificate-authority-data", "tls-server-name", "proxy-url"])
@@ -148,11 +164,12 @@ public struct KubeDocument: Equatable {
                 }
             }
         }
+        // Scanning the lists for each name took 19 ms at 100 entries.
+        let clusters = Set(entries(.clusters).map(\.name)), users = Set(entries(.users).map(\.name))
         for context in entries(.contexts) {
-            let cluster = context.value("cluster")
             let user = context.value("user")
-            if cluster.isEmpty || entry(.clusters, named: cluster) == nil { issues.append("Context ‘\(context.name)’ refers to a missing cluster.") }
-            if !user.isEmpty && entry(.users, named: user) == nil { issues.append("Context ‘\(context.name)’ refers to a missing user.") }
+            if !clusters.contains(context.value("cluster")) { issues.append("Context ‘\(context.name)’ refers to a missing cluster.") }
+            if !user.isEmpty && !users.contains(user) { issues.append("Context ‘\(context.name)’ refers to a missing user.") }
             for key in ["cluster", "user", "namespace"] {
                 if let value = context.fields[key], value.tag != Tag(.str) && value.null == nil {
                     issues.append("\(key.capitalized) in context ‘\(context.name)’ must be a string.")
@@ -175,20 +192,38 @@ public struct KubeDocument: Equatable {
         root["current-context"] = Self.string(name)
     }
 
+    private static let currentContextValue = try! NSRegularExpression(
+        pattern: #"^current-context[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\r\n]|'')*'|(?!#)(?:(?![ \t]+#)[^\r\n])*)"#,
+        options: .anchorsMatchLines)
+
+    /// Changes only the active context in `yaml`, keeping comments and formatting, since a switch skips the diff.
+    /// Returns nil unless the result parses back to exactly that change, as with JSON or a multi-line value.
+    public static func settingCurrentContext(_ name: String, in yaml: String) -> String? {
+        guard var expected = try? KubeDocument(yaml: yaml) else { return nil }
+        if expected.currentContext == name { return yaml }
+        guard (try? expected.setCurrentContext(name)) != nil,
+              let line = try? Yams.serialize(node: Node([(Node("current-context"), string(name))]), width: -1, allowUnicode: true) else { return nil }
+        let patched: String
+        if let match = currentContextValue.firstMatch(in: yaml, range: NSRange(yaml.startIndex..., in: yaml)), let range = Range(match.range, in: yaml) {
+            patched = yaml.replacingCharacters(in: range, with: line.trimmingCharacters(in: .newlines))
+        } else {
+            patched = (yaml.hasSuffix("\n") ? yaml : yaml + "\n") + line
+        }
+        return (try? KubeDocument(yaml: patched))?.isEquivalent(to: expected) == true ? patched : nil
+    }
+
     /// Patches only fields explicitly supplied by the form, retaining every unfamiliar field.
     public mutating func update(_ kind: EntryKind, originalName: String?, name: String, fields: [String: String]) throws {
+        if let issue = nameIssue(kind, name: name, originalName: originalName) { throw ConfigError.invalid(issue) }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw ConfigError.invalid("Enter a name.") }
-        guard !entries(kind).contains(where: { $0.name == trimmed && $0.name != originalName }) else {
-            throw ConfigError.invalid("A \(kind.singular) named ‘\(trimmed)’ already exists.")
-        }
         var list = entries(kind).map(\.node)
         let index = originalName.flatMap { old in list.firstIndex { $0["name"]?.string == old } }
-        if originalName != nil && index == nil { throw ConfigError.missingEntry(originalName!) }
-        var node = index.map { list[$0] } ?? Node([(Node("name"), Self.string(trimmed)), (Node(kind.singular), Node([] as [(Node, Node)]))])
+        if let originalName, index == nil { throw ConfigError.missingEntry(originalName) }
+        var node = index.map { list[$0] } ?? Node([(Node("name"), Self.string(trimmed)), (Node(kind.singular), .emptyMapping)])
         node["name"] = Self.string(trimmed)
-        var body = node[kind.singular] ?? Node([] as [(Node, Node)])
-        for (key, value) in fields {
+        var body = node[kind.singular] ?? .emptyMapping
+        // Sorted so that several new keys land in the same order on every run.
+        for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
             if value.isEmpty { body.remove(key) } else { body[key] = Self.string(value) }
         }
         node[kind.singular] = body
@@ -198,12 +233,30 @@ public struct KubeDocument: Equatable {
             if kind == .contexts && currentContext == originalName { root["current-context"] = Self.string(trimmed) }
             if kind != .contexts {
                 var contexts = entries(.contexts).map(\.node)
-                for index in contexts.indices where contexts[index]["context"]?[kind.singular]?.string == originalName {
+                for index in contexts.indices where contexts[index]["context"]?[kind.singular]?.text == originalName {
                     contexts[index]["context"]?[kind.singular] = Self.string(trimmed)
                 }
                 root["contexts"] = Node(contexts)
             }
         }
+    }
+
+    public func nameIssue(_ kind: EntryKind, name: String, originalName: String?) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "Enter a name." }
+        if entries(kind).contains(where: { $0.name == trimmed && $0.name != originalName }) {
+            return "A \(kind.singular) named ‘\(trimmed)’ already exists."
+        }
+        return nil
+    }
+
+    /// Clones the whole entry, so unfamiliar fields survive the copy.
+    public mutating func duplicate(_ kind: EntryKind, name: String) throws -> String {
+        guard var node = entry(kind, named: name)?.node else { throw ConfigError.missingEntry(name) }
+        let copy = Self.uniqueName("\(name)-copy") { entry(kind, named: $0) != nil }
+        node["name"] = Self.string(copy)
+        root[kind.rawValue] = Node(entries(kind).map(\.node) + [node])
+        return copy
     }
 
     public func referencingContexts(_ kind: EntryKind, name: String) -> [String] {
@@ -215,41 +268,28 @@ public struct KubeDocument: Equatable {
         guard entry(kind, named: name) != nil else { throw ConfigError.missingEntry(name) }
         let references = referencingContexts(kind, name: name)
         guard references.isEmpty else { throw ConfigError.referenced(name, references) }
-        guard kind != .contexts || currentContext != name else { throw ConfigError.activeContext }
         root[kind.rawValue] = Node(entries(kind).filter { $0.name != name }.map(\.node))
     }
 
-    public var hasRelativePaths: Bool { !relativePaths.isEmpty }
-
-    public var relativePaths: [String] {
-        var paths: [String] = []
-        for kind in [EntryKind.clusters, .users] {
-            for entry in entries(kind) {
-                for key in Self.fileKeys(kind) {
-                    let value = entry.value(key)
-                    if !value.isEmpty && !NSString(string: value).isAbsolutePath { paths.append(value) }
-                }
-                if let command = entry.fields["exec"]?["command"]?.string,
-                   command.contains("/"), !NSString(string: command).isAbsolutePath { paths.append(command) }
-            }
-        }
-        return paths
+    public var hasRelativePaths: Bool {
+        var copy = self
+        return !copy.resolveRelativePaths(relativeTo: URL(fileURLWithPath: "/")).isEmpty
     }
 
     public mutating func resolveRelativePaths(relativeTo directory: URL) -> [String] {
         var resolutions: [String] = []
-        for kind in [EntryKind.clusters, .users] {
+        for kind in EntryKind.referenced {
             var nodes = entries(kind).map(\.node)
             for index in nodes.indices {
                 var fields = nodes[index][kind.singular]!
                 for key in Self.fileKeys(kind) {
-                    if let value = fields[key]?.string, !value.isEmpty, !NSString(string: value).isAbsolutePath {
+                    if let value = fields[key]?.text, !value.isEmpty, !NSString(string: value).isAbsolutePath {
                         let resolved = directory.appendingPathComponent(value).standardizedFileURL.path
                         fields[key] = Self.string(resolved)
                         resolutions.append("\(value) → \(resolved)")
                     }
                 }
-                if let command = fields["exec"]?["command"]?.string,
+                if kind == .users, let command = fields["exec"]?["command"]?.text,
                    command.contains("/"), !NSString(string: command).isAbsolutePath {
                     let resolved = directory.appendingPathComponent(command).standardizedFileURL.path
                     fields["exec"]?["command"] = Self.string(resolved)
@@ -262,10 +302,26 @@ public struct KubeDocument: Equatable {
         return resolutions
     }
 
-    internal static func string(_ value: String) -> Node { Node(value, Tag(.str)) }
+    /// `base`, or the first of `base-2`, `base-3`, and so on that isn't taken.
+    public static func uniqueName(_ base: String, isTaken: (String) -> Bool) -> String {
+        var name = base, suffix = 2
+        while isTaken(name) { name = "\(base)-\(suffix)"; suffix += 1 }
+        return name
+    }
+
+    /// Quotes a string that would otherwise read back as a number, boolean, or null.
+    internal static func string(_ value: String) -> Node { .scalar(value.represented()) }
 
     private static func checkSize(_ text: String) throws {
         guard text.utf8.count <= maximumByteCount else { throw ConfigError.invalid("Configuration exceeds the 16 MB size limit.") }
+    }
+
+    /// Accepts a bare `host:port` too, for which kubectl picks the scheme.
+    private static func isServerAddress(_ text: String) -> Bool {
+        guard !text.contains(where: \.isWhitespace),
+              let url = URL(string: text.contains("://") ? text : "https://" + text),
+              let scheme = url.scheme?.lowercased() else { return false }
+        return ["https", "http"].contains(scheme) && url.host?.isEmpty == false
     }
 
     private static func fileKeys(_ kind: EntryKind) -> [String] {
@@ -279,50 +335,46 @@ public struct KubeDocument: Equatable {
         }
     }
 
-    private static func checkMappings(_ node: Node, path: String, depth: Int) throws {
+    private static func checkMappings(_ node: Node, depth: Int, nodeCount: inout Int) throws {
         guard depth < 64 else { throw ConfigError.invalid("YAML nesting exceeds 64 levels.") }
+        nodeCount += 1
+        guard nodeCount <= maximumNodeCount else { throw ConfigError.invalid("YAML expands to more than a million values.") }
         if let mapping = node.mapping {
-            var keys = Set<String>()
             for pair in mapping {
-                guard let key = pair.key.string, pair.key.tag == Tag(.str) else {
+                // A plain << carries YAML's merge tag, so this comes before the string check.
+                guard pair.key.string != "<<" else { throw ConfigError.invalid("YAML merge keys (<<) are not supported. Expand the mapping before editing.") }
+                guard pair.key.string != nil, pair.key.tag == Tag(.str) else {
                     throw ConfigError.invalid("YAML mapping keys must be strings.")
                 }
-                guard key != "<<" else { throw ConfigError.invalid("YAML merge keys (<<) are not supported. Expand the mapping before editing.") }
-                guard keys.insert(key).inserted else { throw ConfigError.invalid("Duplicate YAML key at \(path). Check the raw YAML.") }
-                try checkMappings(pair.value, path: path + "." + key, depth: depth + 1)
+                try checkMappings(pair.value, depth: depth + 1, nodeCount: &nodeCount)
             }
         } else if let sequence = node.sequence {
-            for value in sequence { try checkMappings(value, path: path, depth: depth + 1) }
+            for value in sequence { try checkMappings(value, depth: depth + 1, nodeCount: &nodeCount) }
         }
-    }
-
-    private static func redacted(_ node: Node, comparedTo previous: Node? = nil) -> Node {
-        if let mapping = node.mapping {
-            return Node(mapping.map { pair in
-                let key = pair.key.string?.lowercased() ?? ""
-                let sensitive = ["token", "id-token", "access-token", "refresh-token", "password", "client-key-data", "client-key", "client-secret", "secret", "args", "env"].contains(key)
-                    || key.contains("password") || key.contains("secret") || key.hasSuffix("token")
-                let label = previous != nil && previous?[pair.key] != pair.value ? "‹changed secret›" : "‹redacted›"
-                return (pair.key, sensitive ? Self.string(label) : redacted(pair.value, comparedTo: previous?[pair.key]))
-            })
-        }
-        if let sequence = node.sequence {
-            return Node(sequence.enumerated().map { index, value in
-                let old = previous?.array()
-                let comparison: Node?
-                if let name = value["name"]?.string { comparison = old?.first { $0["name"]?.string == name } }
-                else { comparison = old.flatMap { $0.indices.contains(index) ? $0[index] : nil } }
-                return redacted(value, comparedTo: comparison)
-            })
-        }
-        return node
     }
 }
 
 extension Node {
+    static var emptyMapping: Node { Node([] as [(Node, Node)]) }
+
+    /// The scalar's text, or nil for a YAML null, which `string` reads back as "null" or "~".
+    var text: String? { tag == Tag(.null) ? nil : string }
+
     mutating func remove(_ key: String) {
         guard var mapping else { return }
         mapping[key] = nil
         self = .mapping(mapping)
+    }
+
+    /// Equality that ignores the order of mapping keys, which carries no meaning in a kubeconfig.
+    func isEquivalent(to other: Node) -> Bool {
+        if let left = mapping, let right = other.mapping {
+            guard left.count == right.count else { return false }
+            return left.allSatisfy { pair in right[pair.key].map { pair.value.isEquivalent(to: $0) } ?? false }
+        }
+        if let left = sequence, let right = other.sequence {
+            return left.count == right.count && zip(left, right).allSatisfy { $0.isEquivalent(to: $1) }
+        }
+        return self == other
     }
 }

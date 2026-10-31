@@ -4,8 +4,10 @@ import SwiftUI
 
 struct ReviewSheet: View {
     @ObservedObject var model: AppModel
-    @State private var reveal = false
     @State private var diff: [DiffLine] = []
+    @State private var coloredLines: [AttributedString] = []
+    @State private var changes: [Range<Int>] = []
+    @State private var current = 0
     @State private var issue: String?
 
     var body: some View {
@@ -13,37 +15,50 @@ struct ReviewSheet: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Review changes").font(.title2).fontWeight(.semibold)
                 Text(model.snapshot?.url.path ?? "").font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                Text("Apply replaces this file. \(model.retention == 0 ? "Backups are disabled." : "Its previous contents will be saved as a backup after Apply.")")
+                Text("\(backupNote) Comments and formatting may change.")
                     .font(.callout).foregroundStyle(.secondary)
-                Toggle("Reveal credentials and original formatting", isOn: $reveal).toggleStyle(.checkbox)
-                    .onChange(of: reveal) { _, _ in refresh() }
-                if !reveal {
-                    Text("Credentials are masked. Formatting and comments may change; reveal the original to inspect those changes.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
             Divider()
             if let issue { ContentUnavailableView("Unable to show changes", systemImage: "exclamationmark.triangle", description: Text(issue)) }
             else {
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(diff) { line in
-                            HStack(alignment: .top, spacing: 10) {
-                                Text(prefix(line.change)).foregroundStyle(color(line.change)).frame(width: 12)
-                                Text(line.text.isEmpty ? " " : line.text).textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                ScrollViewReader { proxy in
+                    ScrollView([.horizontal, .vertical]) {
+                        // Wrapped lines vary in height, and a lazy stack's estimates would jump while scrolling.
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(diff) { line in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Text(prefix(line.change)).foregroundStyle(color(line.change)).frame(width: 12)
+                                    Text(coloredLines[line.id]).textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .font(.system(.callout, design: .monospaced))
+                                .padding(.horizontal, 16).padding(.vertical, 2)
+                                .background(color(line.change).opacity(tint(line)))
+                                .id(line.id)
                             }
-                            .font(.system(.callout, design: .monospaced))
-                            .padding(.horizontal, 16).padding(.vertical, 2)
-                            .background(color(line.change).opacity(line.change == .unchanged ? 0 : 0.08))
-                        }
-                    }.padding(.vertical, 12).frame(minWidth: 700, alignment: .leading)
-                }.background(Color(nsColor: .textBackgroundColor))
+                        }.padding(.vertical, 12).frame(minWidth: 700, alignment: .leading)
+                    }
+                    .defaultScrollAnchor(.topLeading)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .onChange(of: current) { withAnimation { reveal(with: proxy) } }
+                    .onChange(of: changes) {
+                        // Waits for the sheet's first layout, then jumps there without animating.
+                        DispatchQueue.main.async { reveal(with: proxy) }
+                    }
+                }
             }
             Divider()
-            HStack {
-                Label("\(diff.filter { $0.change == .added }.count) added · \(diff.filter { $0.change == .removed }.count) removed", systemImage: "arrow.left.arrow.right")
-                    .font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                GlassIconGroup {
+                    GlassIconButton(title: "Previous Change", symbol: "chevron.up") { current -= 1 }
+                        .keyboardShortcut(.upArrow, modifiers: [])
+                        .disabled(current <= 0)
+                    GlassIconButton(title: "Next Change", symbol: "chevron.down") { current += 1 }
+                        .keyboardShortcut(.downArrow, modifiers: [])
+                        .disabled(current >= changes.count - 1)
+                }
+                Text(changes.isEmpty ? "No line changes" : "Change \(current + 1) of \(changes.count)")
+                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
                 Button("Cancel", action: model.cancelReview).keyboardShortcut(.cancelAction)
                 Button("Apply Changes", action: model.commit)
@@ -56,18 +71,38 @@ struct ReviewSheet: View {
         .interactiveDismissDisabled()
     }
 
+    private var backupNote: String {
+        if model.retention == 0 { return "Backups are disabled." }
+        return model.snapshot?.exists == true ? "The current file will be saved as a backup." : "This creates the file."
+    }
+
     private func refresh() {
         do {
             guard let document = model.document else { return }
-            diff = try ConfigurationDiff.lines(before: model.snapshot?.text ?? "", after: document, reveal: reveal)
+            let lines = try ConfigurationDiff.lines(before: model.snapshot?.text ?? "", after: document)
+            coloredLines = lines.map { YAMLStyle.attributed($0.text.isEmpty ? " " : $0.text) }
+            diff = lines
+            changes = ConfigurationDiff.changes(in: diff)
+            current = 0
             issue = nil
         } catch { issue = error.localizedDescription }
     }
+
+    private func reveal(with proxy: ScrollViewProxy) {
+        guard changes.indices.contains(current) else { return }
+        proxy.scrollTo(diff[changes[current].lowerBound].id, anchor: UnitPoint(x: 0, y: 0.3))
+    }
+
+    private func tint(_ line: DiffLine) -> Double {
+        guard line.change != .unchanged else { return 0 }
+        return changes.indices.contains(current) && changes[current].contains(line.id) ? 0.2 : 0.08
+    }
+
     private func prefix(_ change: DiffLine.Change) -> String { change == .added ? "+" : change == .removed ? "−" : " " }
     private func color(_ change: DiffLine.Change) -> Color { change == .added ? .green : change == .removed ? .red : .secondary }
 }
 
-struct PasteSheet: View {
+struct ImportSourceSheet: View {
     @ObservedObject var model: AppModel
     @State private var yaml = ""
     @State private var directory: URL?
@@ -75,9 +110,17 @@ struct PasteSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Paste kubeconfig YAML").font(.title2).fontWeight(.semibold)
-            Text("Paste the configuration from your provider. You’ll review entries and naming conflicts before merging.")
-                .font(.callout).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Import kubeconfig").font(.title2).fontWeight(.semibold)
+                    Text("Choose a file or paste YAML. You’ll review entries and naming conflicts before merging.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Choose File…") {
+                    do { try model.chooseImportFile() } catch { issue = error.localizedDescription }
+                }
+            }
             TextEditor(text: $yaml)
                 .font(.system(.body, design: .monospaced))
                 .autocorrectionDisabled()
@@ -85,10 +128,11 @@ struct PasteSheet: View {
                 .background(Color(nsColor: .textBackgroundColor))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator, lineWidth: 1))
                 .accessibilityLabel("YAML to import")
+                .onChange(of: yaml) { issue = nil }
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Source folder").fontWeight(.medium)
-                    Text(directory?.path ?? "Required only when this YAML contains relative file paths.")
+                    Text(directory?.path ?? "Required only when pasted YAML contains relative file paths.")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Spacer()
@@ -100,7 +144,7 @@ struct PasteSheet: View {
             if let issue { Label(issue, systemImage: "exclamationmark.circle").foregroundStyle(.orange).font(.callout) }
             HStack {
                 Spacer()
-                Button("Cancel") { model.showPaste = false }.keyboardShortcut(.cancelAction)
+                Button("Cancel") { model.showImportSource = false }.keyboardShortcut(.cancelAction)
                 Button("Preview Import") {
                     do { try model.prepareImport(yaml: yaml, directory: directory) }
                     catch { issue = error.localizedDescription }
@@ -114,32 +158,33 @@ struct ImportSheet: View {
     @ObservedObject var model: AppModel
     @State private var plan: ImportPlan
     @State private var issue: String?
-    @State private var reveal = false
+    /// Fixed for the sheet's lifetime, so typing a destination name doesn't color it all over again.
+    private let importedYAML: AttributedString
 
     init(model: AppModel, initialPlan: ImportPlan) {
         self.model = model
         _plan = State(initialValue: initialPlan)
+        importedYAML = YAMLStyle.attributed((try? initialPlan.incoming.serialized()) ?? "")
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 9) {
                 Text("Review import").font(.title2).fontWeight(.semibold)
-                Text("Resolve names before merging into your draft. Existing entries stay intact unless you choose Replace.")
+                Text("Existing entries stay intact unless you choose Replace.")
                     .font(.callout).foregroundStyle(.secondary)
-                Text("Skip retains an existing entry of the same name when imported contexts refer to it. Missing references must be resolved before merging.")
-                    .font(.caption).foregroundStyle(.secondary)
             }.padding(24)
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    ForEach([EntryKind.clusters, .users, .contexts]) { kind in
-                        if plan.items.contains(where: { $0.kind == kind }) {
+                    ForEach(EntryKind.importOrder) { kind in
+                        let indices = plan.items.indices.filter { plan.items[$0].kind == kind }
+                        if !indices.isEmpty {
                             VStack(alignment: .leading, spacing: 10) {
                                 Label(kind.title, systemImage: kind.symbol).font(.headline)
-                                ForEach(plan.items.indices.filter { plan.items[$0].kind == kind }, id: \.self) { index in
+                                ForEach(indices, id: \.self) { index in
                                     importRow(index)
-                                    if index != plan.items.indices.last { Divider() }
+                                    if index != indices.last { Divider() }
                                 }
                             }
                         }
@@ -154,8 +199,7 @@ struct ImportSheet: View {
                         }
                     }
                     DisclosureGroup("Imported configuration") {
-                        Toggle("Reveal credentials", isOn: $reveal).toggleStyle(.checkbox).padding(.vertical, 8)
-                        Text((try? plan.incoming.serialized(revealingSecrets: reveal)) ?? "")
+                        Text(importedYAML)
                             .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -169,9 +213,8 @@ struct ImportSheet: View {
                 }
                 if let issue { Label(issue, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange) }
                 HStack {
-                    Text("The file changes only after Apply.").font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Cancel") { model.showImport = false; model.importPlan = nil }.keyboardShortcut(.cancelAction)
+                    Button("Cancel", action: model.closeImport).keyboardShortcut(.cancelAction)
                     Button("Merge into Draft") {
                         do {
                             try model.acceptImport(plan)
@@ -183,28 +226,29 @@ struct ImportSheet: View {
     }
 
     private func importRow(_ index: Int) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let item = plan.items[index]
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(plan.items[index].originalName).fontWeight(.medium).lineLimit(2)
-                    Text(plan.items[index].identical ? "Identical entry exists" : plan.items[index].conflicts ? "Name already exists" : "New entry")
-                        .font(.caption).foregroundStyle(plan.items[index].conflicts && !plan.items[index].identical ? Color.orange : .secondary)
+                    Text(item.originalName).fontWeight(.medium).lineLimit(2)
+                    Text(item.identical ? "Identical entry exists" : item.conflicts ? "Name already exists" : "New entry")
+                        .font(.caption).foregroundStyle(item.conflicts && !item.identical ? Color.orange : .secondary)
                 }
                 Spacer()
                 Picker("Action", selection: $plan.items[index].action) {
-                    Text(plan.items[index].conflicts ? "Rename imported" : "Add").tag(ImportAction.rename)
-                    if plan.items[index].conflicts { Text("Replace existing").tag(ImportAction.replace) }
+                    Text(item.conflicts ? "Rename imported" : "Add").tag(ImportAction.rename)
+                    if item.conflicts { Text("Replace existing").tag(ImportAction.replace) }
                     Text("Skip").tag(ImportAction.skip)
-                    if plan.items[index].identical { Text("Reuse existing").tag(ImportAction.reuse) }
-                }.labelsHidden().frame(width: 165).accessibilityLabel("Import action for \(plan.items[index].originalName)")
+                    if item.identical { Text("Reuse existing").tag(ImportAction.reuse) }
+                }.labelsHidden().frame(width: 165).accessibilityLabel("Import action for \(item.originalName)")
             }
-            if plan.items[index].action == .rename {
+            if item.action == .rename {
                 HStack {
                     Text("Import as").font(.caption).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
                     TextField("Destination name", text: $plan.items[index].destinationName).textFieldStyle(.roundedBorder)
                 }
             }
-            if plan.items[index].action == .replace {
+            if item.action == .replace {
                 Label("Existing contexts using this name will use the imported settings.", systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -213,29 +257,37 @@ struct ImportSheet: View {
 }
 
 struct PreferencesView: View {
-    @AppStorage("backupRetention") private var retention = 10
+    @AppStorage(BackupRetention.key) private var retention = BackupRetention.defaultCount
+    @AppStorage(ContextSwitching.immediateKey) private var switchesImmediately = ContextSwitching.immediateByDefault
     var body: some View {
         Form {
             Section {
-                Stepper(value: Binding(get: { min(1000, max(0, retention)) }, set: { retention = $0 }), in: 0...1000) {
+                Toggle("Switch contexts immediately", isOn: $switchesImmediately)
+            } header: { Text("Contexts") } footer: {
+                Text(switchesImmediately
+                     ? "Make Active and double-click write the active context to the file right away, with no backup. Other pending changes stay in the draft."
+                     : "Make Active and double-click stage the switch for Apply.")
+            }
+            Section {
+                Stepper(value: Binding(get: { BackupRetention.clamped(retention) }, set: { retention = $0 }), in: BackupRetention.range) {
                     HStack {
                         Text("Backups per configuration")
                         Spacer()
                         TextField("Count", value: $retention, format: .number)
                             .multilineTextAlignment(.trailing).frame(width: 60)
-                            .onChange(of: retention) { _, value in retention = min(1000, max(0, value)) }
+                            .onChange(of: retention) { _, value in retention = BackupRetention.clamped(value) }
                     }
                 }
                 if retention == 0 {
                     Label("Backups disabled", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
                 }
             } header: { Text("Rolling backups") } footer: {
-                Text("After each successful Apply, save the previous contents. Keep the newest \(retention) per file. Older backups are removed after the next successful Apply. Set zero to disable backups and remove existing history on the next Apply.")
+                Text("Keeps the newest \(retention) per file. Set zero to disable backups and remove existing history on the next Apply.")
             }
             Section {
                 LabeledContent("Default configuration", value: "~/.kube/config")
-                LabeledContent("Version", value: "1.0")
+                LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development")
             }
-        }.formStyle(.grouped).padding(10).frame(width: 480, height: 320)
+        }.formStyle(.grouped).padding(10).frame(width: 480, height: 430)
     }
 }

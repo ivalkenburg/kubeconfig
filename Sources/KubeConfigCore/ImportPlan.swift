@@ -1,9 +1,8 @@
 import Foundation
 import Yams
 
-public enum ImportAction: String, CaseIterable, Identifiable {
+public enum ImportAction {
     case rename, replace, skip, reuse
-    public var id: String { rawValue }
 }
 
 public struct ImportItem: Identifiable {
@@ -33,20 +32,15 @@ public struct ImportPlan {
         self.incoming = resolved
         items = []
         var nameMaps: [EntryKind: [String: String]] = [:]
-        for kind in [EntryKind.clusters, .users, .contexts] {
+        for kind in EntryKind.importOrder {
             var reserved = Set(target.entries(kind).map(\.name) + resolved.entries(kind).map(\.name))
             for entry in resolved.entries(kind) {
                 let existing = target.entry(kind, named: entry.name)
                 var comparable = entry.node
                 if kind == .contexts { Self.rewriteContext(&comparable, maps: nameMaps) }
-                let identical = existing.map { Self.equivalent($0.node, comparable) } ?? false
+                let identical = existing?.node.isEquivalent(to: comparable) ?? false
                 let needsRename = existing != nil && !identical
-                var destination = entry.name
-                if needsRename {
-                    destination = entry.name + "-imported"
-                    var suffix = 2
-                    while reserved.contains(destination) { destination = entry.name + "-imported-\(suffix)"; suffix += 1 }
-                }
+                let destination = needsRename ? KubeDocument.uniqueName(entry.name + "-imported", isTaken: reserved.contains) : entry.name
                 reserved.insert(destination)
                 nameMaps[kind, default: [:]][entry.name] = destination
                 items.append(ImportItem(kind: kind, originalName: entry.name, conflicts: existing != nil,
@@ -63,7 +57,7 @@ public struct ImportPlan {
             guard !destination.isEmpty else { throw ConfigError.invalid("Every imported entry needs a destination name.") }
             maps[item.kind, default: [:]][item.originalName] = destination
         }
-        for kind in [EntryKind.clusters, .users, .contexts] {
+        for kind in EntryKind.importOrder {
             var list = result.entries(kind).map(\.node)
             var destinations = Set<String>()
             for item in items where item.kind == kind {
@@ -77,7 +71,7 @@ public struct ImportPlan {
                 switch item.action {
                 case .skip: break
                 case .reuse:
-                    guard let existing, Self.equivalent(list[existing], node) else {
+                    guard let existing, list[existing].isEquivalent(to: node) else {
                         throw ConfigError.invalid("‘\(item.originalName)’ is no longer identical after reference changes. Rename or replace it instead.")
                     }
                 case .replace:
@@ -108,26 +102,16 @@ public struct ImportPlan {
     }
 
     private static func rewriteContext(_ node: inout Node, maps: [EntryKind: [String: String]]) {
-        for kind in [EntryKind.clusters, .users] {
-            if let reference = node["context"]?[kind.singular]?.string, let name = maps[kind]?[reference] {
+        for kind in EntryKind.referenced {
+            if let reference = node["context"]?[kind.singular]?.text, let name = maps[kind]?[reference] {
                 node["context"]?[kind.singular] = KubeDocument.string(name)
             }
         }
     }
 
-    private static func equivalent(_ lhs: Node, _ rhs: Node) -> Bool {
-        if let left = lhs.mapping, let right = rhs.mapping {
-            guard left.count == right.count else { return false }
-            return left.allSatisfy { pair in right[pair.key].map { equivalent(pair.value, $0) } ?? false }
-        }
-        if let left = lhs.sequence, let right = rhs.sequence {
-            return left.count == right.count && zip(left, right).allSatisfy(equivalent)
-        }
-        return lhs == rhs
-    }
-
     private static func mergeMetadata(_ old: Node, _ new: Node, path: String) throws -> Node {
-        if equivalent(old, new) { return old }
+        if old.isEquivalent(to: new) || new.tag == Tag(.null) { return old }
+        if old.tag == Tag(.null) { return new }
         if old.mapping != nil, let mapping = new.mapping {
             var result = old
             for pair in mapping {
@@ -139,14 +123,18 @@ public struct ImportPlan {
         if let left = old.sequence, let right = new.sequence {
             var result = Array(left)
             for value in right {
-                if result.contains(where: { equivalent($0, value) }) { continue }
+                if result.contains(where: { $0.isEquivalent(to: value) }) { continue }
                 if let name = value["name"]?.string, result.contains(where: { $0["name"]?.string == name }) {
-                    throw ConfigError.invalid("Imported metadata conflicts at \(path). Resolve that field in the YAML editor before importing.")
+                    throw metadataConflict(at: path)
                 }
                 result.append(value)
             }
             return Node(result)
         }
-        throw ConfigError.invalid("Imported metadata conflicts at \(path). Resolve that field in the YAML editor before importing.")
+        throw metadataConflict(at: path)
+    }
+
+    private static func metadataConflict(at path: String) -> ConfigError {
+        .invalid("Imported metadata conflicts at \(path). Resolve that field in the YAML editor before importing.")
     }
 }

@@ -18,7 +18,7 @@
       {
         "role": "primary",
         "source": "Color.accentColor",
-        "purpose": "Active-context and section symbols; native prominent actions."
+        "purpose": "Active-context symbols; native prominent actions."
       },
       {
         "role": "text",
@@ -32,8 +32,8 @@
       },
       {
         "role": "material",
-        "source": ".bar / .separator / .quaternary.opacity(0.5)",
-        "purpose": "Footer, dividers, and search surround."
+        "source": ".separator / .quaternary.opacity(0.5)",
+        "purpose": "Dividers and search surround."
       },
       {
         "role": "status",
@@ -76,7 +76,7 @@
           780,
           620
         ],
-        "paste": [
+        "importSource": [
           680,
           600
         ],
@@ -84,7 +84,7 @@
           800,
           680
         ],
-        "preferences": [
+        "settings": [
           480,
           320
         ]
@@ -101,11 +101,14 @@
         "Sources/KubeConfig/KubeConfigApp.swift",
         "Sources/KubeConfig/MainView.swift",
         "Sources/KubeConfig/EntryDetailView.swift",
-        "Sources/KubeConfig/Sheets.swift"
+        "Sources/KubeConfig/Sheets.swift",
+        "Sources/KubeConfig/YAMLEditor.swift"
       ],
       "captures": [
         ".impeccable/review/contexts-light.png",
-        ".impeccable/review/contexts-dark.png"
+        ".impeccable/review/contexts-dark.png",
+        ".impeccable/review/contexts-pending.png",
+        ".impeccable/review/yaml.png"
       ],
       "identityAsset": "Assets/AppIcon.png"
     }
@@ -114,21 +117,21 @@
     {
       "name": "Prominent action",
       "kind": "button",
-      "description": "Apply, creation, rollback, and sheet confirmation actions; native states and sizing.",
+      "description": "Apply uses glass in the toolbar; creation and sheet confirmations stay bordered. Native states and sizing.",
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/MainView.swift",
-        "pattern": "Button(...).buttonStyle(.borderedProminent)"
+        "pattern": "Button(...).buttonStyle(.glassProminent) or .borderedProminent"
       }
     },
     {
       "name": "Utility action",
       "kind": "button",
-      "description": "Add, refresh, and file-chooser actions retain native help and accessibility labels.",
+      "description": "Add, refresh, and file-chooser actions retain native help and accessibility labels. Detail headers use circular glass icon buttons.",
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/MainView.swift",
-        "pattern": "Button(...).buttonStyle(.borderless)"
+        "pattern": "Button(...).buttonStyle(.borderless) or GlassIconButton(...)"
       }
     },
     {
@@ -155,7 +158,7 @@
     {
       "name": "Grouped editor",
       "kind": "custom",
-      "description": "Platform-owned form rows, text fields, secure fields, pickers, and toggles.",
+      "description": "Platform-owned form rows, text fields, and pickers. Credentials use plain text fields.",
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/EntryDetailView.swift",
@@ -165,11 +168,11 @@
     {
       "name": "Detail header",
       "kind": "custom",
-      "description": "Semibold title2, supporting callout, symbol tile, and context action.",
+      "description": "Semibold title2 with glass icon actions.",
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/EntryDetailView.swift",
-        "pattern": "HStack { sectionSymbol; titleAndSubtitle; action }.padding(24)"
+        "pattern": "HStack { title; Spacer(); GlassIconGroup { GlassIconButton(...) } }"
       },
       "refersTo": "detail-header"
     },
@@ -191,17 +194,28 @@
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/Sheets.swift",
-        "pattern": "ScrollView([.horizontal, .vertical]) { LazyVStack { diffLines } }"
+        "pattern": "ScrollView([.horizontal, .vertical]) { VStack { diffLines } }"
+      }
+    },
+    {
+      "name": "YAML editor",
+      "kind": "custom",
+      "description": "Monospaced editor with syntax colors, a line-number gutter, and a parse error marker.",
+      "nativeImplementation": {
+        "language": "SwiftUI",
+        "source": "Sources/KubeConfig/YAMLEditor.swift",
+        "pattern": "NSViewRepresentable wrapping NSTextView with an NSRulerView"
       }
     }
   ],
   "narrative": {
     "northStar": "A familiar, compact macOS configuration editor",
-    "overview": "KubeConfig uses standard macOS controls, system typography, compact spacing, and automatic light/dark appearance. The visual priority is quick inspection and careful editing of a local configuration, with familiar navigation and explicit review before writing to disk.\n\nSwiftUI and AppKit own control rendering, keyboard focus, selection, materials, and adaptive type. SF Symbols identify sections and actions. The generated blue hexagonal cluster icon with white configuration sliders is the app identity asset; its artwork does not define a fixed interface palette.",
+    "overview": "KubeConfig uses standard macOS controls, Liquid Glass chrome, system typography, compact spacing, and automatic light/dark appearance. The visual priority is quick inspection and careful editing of a local configuration, with familiar navigation and explicit review before writing to disk.\n\nSwiftUI and AppKit own control rendering, keyboard focus, selection, materials, and adaptive type. SF Symbols identify sections and actions. The generated blue hexagonal cluster icon with white configuration sliders is the app identity asset; its artwork does not define a fixed interface palette.",
     "keyCharacteristics": [
       "Compact three-column workspace.",
       "Adaptive macOS colors and semantic system type.",
-      "Native controls and SF Symbols.",
+      "Native controls and SF Symbols, with glass reserved for chrome.",
+      "Actions that never move: Undo, Discard, and Apply stay in the toolbar.",
       "Visible draft state and reviewable changes."
     ],
     "rules": [
@@ -216,13 +230,15 @@
       "Do preserve native focus, keyboard shortcuts, disabled states, and accessible action labels.",
       "Do keep search available for contexts, clusters, users, and backups, including clear-search and empty-result states.",
       "Do pair warnings and diff colors with symbols, text, or change prefixes.",
-      "Do distinguish selection, active context, and pending changes in labels and affordances."
+      "Do distinguish selection, active context, and pending changes in labels and affordances.",
+      "Do keep every action reachable by more than right-click: a toolbar or header button, a menu item, or a shortcut."
     ],
     "donts": [
       "Don't freeze screenshot RGB values or system type sizes into brand tokens.",
       "Don't replace standard macOS controls with custom web or mobile imitations.",
       "Don't use the app icon's blue as a mandatory interface accent; retain Color.accentColor.",
-      "Don't introduce decorative shadows, display fonts, or ornamental panels into the compact workspace."
+      "Don't introduce decorative shadows, display fonts, or ornamental panels into the compact workspace.",
+      "Don't put glass on forms, list rows, or code surfaces."
     ]
   }
 }

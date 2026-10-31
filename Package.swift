@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "KubeConfig",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("26.0")],
     products: [
         .library(name: "KubeConfigCore", targets: ["KubeConfigCore"]),
         .executable(name: "KubeConfig", targets: ["KubeConfig"])
