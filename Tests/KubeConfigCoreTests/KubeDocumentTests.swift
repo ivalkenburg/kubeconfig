@@ -61,6 +61,25 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertNil(KubeDocument.settingCurrentContext("missing", in: kubeconfig("current-context: dev\n")))
     }
 
+    func testAddingCurrentContextToACRLFFileKeepsItsLineBreaks() {
+        let crlf = "contexts:\r\n- {name: dev, context: {}}\r\n"
+        XCTAssertEqual(KubeDocument.settingCurrentContext("dev", in: crlf), crlf + "current-context: dev\r\n")
+    }
+
+    func testAFileStartingWithAByteOrderMarkParses() throws {
+        let doc = try KubeDocument(yaml: "\u{FEFF}" + Fixtures.yaml)
+        XCTAssertEqual(doc, try Fixtures.document())
+    }
+
+    func testExplicitStringTagsStayStringsThroughSerialization() throws {
+        let doc = try KubeDocument(yaml: "users:\n- name: u\n  user:\n    password: !!str 1234\n    token: !!str true\n")
+        XCTAssertEqual(doc.validationIssues, [])
+        let reloaded = try KubeDocument(yaml: doc.serialized())
+        XCTAssertEqual(reloaded.validationIssues, [])
+        XCTAssertEqual(reloaded, doc)
+        XCTAssertEqual(reloaded.entry(.users, named: "u")?.value("password"), "1234")
+    }
+
     func testNamespaceEditRetainsReferencesAndUnknownContextFields() throws {
         var doc = try Fixtures.document()
         let old = doc.entry(.contexts, named: "development")!

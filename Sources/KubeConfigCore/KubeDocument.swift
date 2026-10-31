@@ -76,6 +76,8 @@ public struct KubeDocument: Equatable {
 
     public init(yaml: String) throws {
         try Self.checkSize(yaml)
+        // Yams reads a byte order mark as content, which puts the first line out of step with the rest.
+        let yaml = yaml.unicodeScalars.first == "\u{FEFF}" ? String(yaml.unicodeScalars.dropFirst()) : yaml
         do {
             guard let parsed = try Yams.compose(yaml: yaml), parsed.mapping != nil else {
                 throw ConfigError.invalid("A kubeconfig must be a YAML mapping.")
@@ -93,6 +95,8 @@ public struct KubeDocument: Equatable {
         }
         var nodeCount = 0
         try Self.checkMappings(root, depth: 0, nodeCount: &nodeCount)
+        // Rewriting the tree doubled parse time, and the draft is parsed on every keystroke.
+        if yaml.contains("!!str") { root = Self.keepingStrings(root) }
         for kind in EntryKind.allCases {
             guard let node = root[kind.rawValue], node.null == nil else { continue }
             guard node.sequence != nil else { throw ConfigError.invalid("\(kind.title) must be a YAML list.") }
@@ -207,7 +211,8 @@ public struct KubeDocument: Equatable {
         if let match = currentContextValue.firstMatch(in: yaml, range: NSRange(yaml.startIndex..., in: yaml)), let range = Range(match.range, in: yaml) {
             patched = yaml.replacingCharacters(in: range, with: line.trimmingCharacters(in: .newlines))
         } else {
-            patched = (yaml.hasSuffix("\n") ? yaml : yaml + "\n") + line
+            let lineBreak = yaml.contains("\r\n") ? "\r\n" : "\n"
+            patched = (yaml.last?.isNewline == true ? yaml : yaml + lineBreak) + line.trimmingCharacters(in: .newlines) + lineBreak
         }
         return (try? KubeDocument(yaml: patched))?.isEquivalent(to: expected) == true ? patched : nil
     }
@@ -311,6 +316,16 @@ public struct KubeDocument: Equatable {
 
     /// Quotes a string that would otherwise read back as a number, boolean, or null.
     internal static func string(_ value: String) -> Node { .scalar(value.represented()) }
+
+    /// The emitter drops a `!!str` tag, so `!!str 123` has to be quoted or it would read back as a number.
+    private static func keepingStrings(_ node: Node) -> Node {
+        if let mapping = node.mapping {
+            return Node(mapping.map { (keepingStrings($0.key), keepingStrings($0.value)) }, mapping.tag, mapping.style)
+        }
+        if let sequence = node.sequence { return Node(sequence.map(keepingStrings), sequence.tag, sequence.style) }
+        guard node.tag == Tag(.str), node.scalar?.style == .plain, let text = node.string else { return node }
+        return string(text)
+    }
 
     private static func checkSize(_ text: String) throws {
         guard text.utf8.count <= maximumByteCount else { throw ConfigError.invalid("Configuration exceeds the 16 MB size limit.") }
