@@ -28,7 +28,9 @@ public struct ImportPlan {
         if resolved.hasRelativePaths && sourceDirectory == nil {
             throw ConfigError.invalid("Choose the source folder to resolve the relative file paths in this import.")
         }
-        resolvedPaths = sourceDirectory.map { resolved.resolveRelativePaths(relativeTo: $0) } ?? []
+        // Entries can share a file, and the sheet identifies these rows by their text.
+        var listed = Set<String>()
+        resolvedPaths = (sourceDirectory.map { resolved.resolveRelativePaths(relativeTo: $0) } ?? []).filter { listed.insert($0).inserted }
         self.incoming = resolved
         items = []
         var nameMaps: [EntryKind: [String: String]] = [:]

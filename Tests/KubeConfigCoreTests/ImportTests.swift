@@ -96,6 +96,13 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(merged.entry(.users, named: "bare")!.fields["exec"]?["command"]?.string, "aws")
     }
 
+    func testAPathSharedByEntriesIsListedOnce() throws {
+        let incoming = try KubeDocument(yaml: "users: [{name: a, user: {client-key: key}}, {name: b, user: {client-key: key}}]\n")
+        let plan = try ImportPlan(target: .empty, incoming: incoming, sourceDirectory: source)
+        XCTAssertEqual(plan.resolvedPaths, ["key → /test/provider/key"])
+        XCTAssertEqual(plan.incoming.entry(.users, named: "b")?.value("client-key"), "/test/provider/key")
+    }
+
     func testImportedOpaqueMetadataIsPreservedAndConflictsAreNotSilentlyDropped() throws {
         let target = try KubeDocument(yaml: "preferences: {one: 1}\nvendor: {value: existing}\n")
         let source = try KubeDocument(yaml: "preferences: {two: 2}\nnew-vendor: {flag: true}\n")
