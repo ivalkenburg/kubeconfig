@@ -45,6 +45,19 @@ extension KubeDocument {
     /// Whether the two differ at most by key order, or by empty lists or an empty active context that one of them leaves out.
     public func isEquivalent(to other: KubeDocument) -> Bool { trimmedRoot.isEquivalent(to: other.trimmedRoot) }
 
+    /// Uses `disk`'s copy of each entry that differs only by key order, as clearing a field and setting it again leaves it,
+    /// so that the serialized draft shows no change there.
+    public func adoptingKeyOrder(of disk: KubeDocument) -> KubeDocument {
+        var result = self
+        for kind in EntryKind.allCases where !entries(kind).isEmpty {
+            let old = Dictionary(disk.entries(kind).map { ($0.name, $0.node) }, uniquingKeysWith: { first, _ in first })
+            result.root[kind.rawValue] = Node(entries(kind).map { entry in
+                old[entry.name].flatMap { $0.isEquivalent(to: entry.node) ? $0 : nil } ?? entry.node
+            })
+        }
+        return result
+    }
+
     private var trimmedRoot: Node {
         var trimmed = root
         for kind in EntryKind.allCases where entries(kind).isEmpty { trimmed.remove(kind.rawValue) }

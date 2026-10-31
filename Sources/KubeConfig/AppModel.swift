@@ -176,7 +176,8 @@ final class AppModel: ObservableObject {
     /// The draft with any form edit that hasn't been committed yet, so counts stay right while typing.
     private var previewDocument: KubeDocument? {
         guard let editor, formIsDirty, var next = document else { return document }
-        return (try? next.update(editor.kind, originalName: editor.originalName, name: editor.name, fields: changedFields(editor))) == nil ? document : next
+        guard (try? next.update(editor.kind, originalName: editor.originalName, name: editor.name, fields: changedFields(editor))) != nil else { return document }
+        return diskDocument.map(next.adoptingKeyOrder) ?? next
     }
     private var diskEntry: ConfigEntry? {
         editor.flatMap { diskDocument?.entry($0.kind, named: $0.originalName) }
@@ -250,11 +251,13 @@ final class AppModel: ObservableObject {
     private func clearEditor() { editor = nil; loadedEditor = nil }
 
     func stage(_ next: KubeDocument, message: String? = nil) throws {
+        let next = diskDocument.map(next.adoptingKeyOrder) ?? next
         let serialized = try next.serialized()
         // Keep the file's own text when nothing differs, so changing a value back leaves nothing to apply.
-        let text = diskDocument?.isEquivalent(to: next) == true ? (snapshot?.text ?? serialized) : serialized
+        let unchanged = diskDocument?.isEquivalent(to: next) == true
+        let text = unchanged ? (snapshot?.text ?? serialized) : serialized
         if text != draftText { recordStep() }
-        document = next
+        document = unchanged ? diskDocument : next
         draftText = text
         parseIssue = nil
         parseIssueLine = nil
@@ -461,7 +464,7 @@ final class AppModel: ObservableObject {
         redoStack = redoStack.map { draft($0, following: name) }
         document = next
         draftText = draft(text, following: name)
-        statusMessage = name.isEmpty ? stagedMessage : "Switched to ‘\(name)’"
+        statusMessage = nil
     }
 
     /// Keeps the file's own text when nothing differs, as `stage` does, so a matching draft leaves nothing to apply.

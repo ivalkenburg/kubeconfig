@@ -73,7 +73,7 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), commented.replacingOccurrences(of: "current-context: dev", with: "current-context: other"))
             XCTAssertEqual(model.document?.currentContext, "other")
             XCTAssertFalse(model.hasPendingChanges)
-            XCTAssertEqual(model.draftStatus, "Switched to ‘other’")
+            XCTAssertNil(model.draftStatus)
             XCTAssertFalse(model.showReview)
             model.refreshBackups()
             XCTAssertTrue(model.records.isEmpty)
@@ -123,7 +123,7 @@ final class AppModelTests: XCTestCase {
             XCTAssertEqual(try KubeDocument(yaml: String(contentsOf: url, encoding: .utf8)).currentContext, "")
             XCTAssertEqual(model.document?.currentContext, "")
             XCTAssertFalse(model.hasPendingChanges)
-            XCTAssertEqual(model.draftStatus, "Active context cleared")
+            XCTAssertNil(model.draftStatus)
         }
     }
 
@@ -1613,6 +1613,33 @@ extension AppModelTests {
         try await withModel { model, _ in
             model.revealBackups()
             XCTAssertEqual(model.draftStatus, "No backups yet")
+        }
+    }
+
+    func testClearingAReferenceAndChoosingItAgainLeavesNothingToApply() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["cluster"] = ""
+            model.commitForm()
+            XCTAssertTrue(model.hasPendingChanges)
+            model.editor?.fields["cluster"] = "dev"
+            model.commitForm()
+            XCTAssertFalse(model.hasPendingChanges)
+            XCTAssertEqual(model.reviewCount, 0)
+            XCTAssertEqual(model.pendingChanges?.count, 0)
+        }
+    }
+
+    func testAFieldSetBackDoesNotCountAlongsideAnotherPendingChange() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["cluster"] = ""
+            model.commitForm()
+            model.editor?.fields["cluster"] = "dev"
+            model.commitForm()
+            model.selectEntry("other")
+            model.editor?.fields["namespace"] = "changed"
+            model.commitForm()
+            XCTAssertEqual(model.reviewCount, 1)
+            XCTAssertEqual(model.pendingChanges?.count, 1)
         }
     }
 
