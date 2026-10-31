@@ -146,7 +146,10 @@ struct YAMLEditor: NSViewRepresentable {
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 undo.removeAllActions()
                 highlight()
-                DispatchQueue.main.async { [weak self] in self?.publishUndoState() }
+                DispatchQueue.main.async { [weak self] in
+                    self?.publishUndoState()
+                    self?.showLineStarts()
+                }
             }
             if ruler.errorLine != errorLine { ruler.errorLine = errorLine }
         }
@@ -156,19 +159,25 @@ struct YAMLEditor: NSViewRepresentable {
             wraps = wrap
             let unlimited = CGFloat.greatestFiniteMagnitude
             let clip = scrollView.contentView
-            // The gutter sits in the clip view's inset, so that's where the text's left edge starts.
-            let leading = clip.contentInsets.left
-            let width = clip.bounds.width - leading
+            let width = clip.bounds.width - clip.contentInsets.left
             scrollView.hasHorizontalScroller = !wrap
             textView.isHorizontallyResizable = !wrap
             container.widthTracksTextView = wrap
             container.containerSize = NSSize(width: wrap ? max(0, width - textView.textContainerInset.width * 2) : unlimited, height: unlimited)
             if wrap {
                 textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
-                clip.scroll(to: NSPoint(x: -leading, y: clip.bounds.minY))
-                scrollView.reflectScrolledClipView(clip)
+                showLineStarts()
             }
             ruler?.needsDisplay = true
+        }
+
+        /// The gutter sits in the clip view's inset, so that's where the text's left edge starts.
+        /// A text view wider than the clip view otherwise opens scrolled to zero, with line starts behind the gutter.
+        private func showLineStarts() {
+            guard let scrollView else { return }
+            let clip = scrollView.contentView
+            clip.scroll(to: NSPoint(x: -clip.contentInsets.left, y: clip.bounds.minY))
+            scrollView.reflectScrolledClipView(clip)
         }
 
         func textDidChange(_ notification: Notification) {

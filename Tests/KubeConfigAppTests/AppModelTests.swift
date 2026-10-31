@@ -1,5 +1,6 @@
 import XCTest
 import KubeConfigCore
+import SwiftUI
 @testable import KubeConfig
 
 final class AppModelTests: XCTestCase {
@@ -18,7 +19,7 @@ final class AppModelTests: XCTestCase {
     current-context: dev
     """ + "\n"
 
-    fileprivate func withModel(initial: String? = fixture, backupFiles: any FileAccess = LocalFileAccess(), immediate: Bool? = false, _ body: @MainActor (AppModel, URL) throws -> Void) async throws {
+    @MainActor fileprivate func withModel(initial: String? = fixture, backupFiles: any FileAccess = LocalFileAccess(), immediate: Bool? = false, _ body: @MainActor (AppModel, URL) async throws -> Void) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("KubeConfigAppTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -27,12 +28,9 @@ final class AppModelTests: XCTestCase {
         let suite = "KubeConfigTests.\(UUID().uuidString)"
         defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
         let store = ConfigurationStore(backups: BackupStore(directory: directory.appendingPathComponent("backups"), files: backupFiles))
-        try await MainActor.run {
-            let defaults = UserDefaults(suiteName: suite)!
-            if let immediate { defaults.set(immediate, forKey: ContextSwitching.immediateKey) }
-            let model = AppModel(store: store, defaults: defaults, initialURL: url)
-            try body(model, url)
-        }
+        let defaults = UserDefaults(suiteName: suite)!
+        if let immediate { defaults.set(immediate, forKey: ContextSwitching.immediateKey) }
+        try await body(AppModel(store: store, defaults: defaults, initialURL: url), url)
     }
 
     @MainActor private func reviewed(_ model: AppModel) throws -> Int {
@@ -1142,6 +1140,29 @@ final class AppModelTests: XCTestCase {
             XCTAssertTrue(container.widthTracksTextView)
             XCTAssertEqual(container.containerSize.width, editor.textView.frame.width - 12, "The inset applies on both sides")
         }
+    }
+
+    func testLongLinesOpenWithTheirStartClearOfTheGutter() async throws {
+        let long = "kind: Config\nnote: " + String(repeating: "QUJD", count: 800) + "\n"
+        try await withModel(initial: long) { model, _ in
+            model.toggleRawEditor()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: YAMLEditor(model: model).frame(width: 500, height: 200))
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            // Suspends, since the editor's main-queue work can't run from inside this test's own turn.
+            try await Task.sleep(for: .milliseconds(300))
+            let scrollView = try XCTUnwrap(Self.scrollView(in: host))
+            let clip = scrollView.contentView
+            XCTAssertGreaterThan(clip.contentInsets.left, 0)
+            XCTAssertEqual(clip.bounds.minX, -clip.contentInsets.left)
+        }
+    }
+
+    @MainActor private static func scrollView(in view: NSView) -> NSScrollView? {
+        view.subviews.lazy.compactMap { ($0 as? NSScrollView) ?? scrollView(in: $0) }.first
     }
 
     func testAnEmptyFileOffersTheSamePathAsAMissingOne() async throws {
