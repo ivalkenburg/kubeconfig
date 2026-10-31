@@ -94,8 +94,11 @@ public struct ImportPlan {
             }
         }
         if activateImportedContext, !incoming.currentContext.isEmpty {
-            let selected = maps[.contexts]?[incoming.currentContext] ?? incoming.currentContext
-            try result.setCurrentContext(selected)
+            let name = incoming.currentContext
+            guard let item = items.first(where: { $0.kind == .contexts && $0.originalName == name }), item.action != .skip else {
+                throw ConfigError.invalid("‘\(name)’ isn’t being imported, so it can’t be made active. Import it or turn off activation.")
+            }
+            try result.setCurrentContext(maps[.contexts]![name]!)
         }
         try result.validate()
         return result

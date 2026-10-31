@@ -18,7 +18,7 @@ final class AppModelTests: XCTestCase {
     current-context: dev
     """ + "\n"
 
-    private func withModel(initial: String? = fixture, backupFiles: any FileAccess = LocalFileAccess(), immediate: Bool? = false, _ body: @MainActor (AppModel, URL) throws -> Void) async throws {
+    fileprivate func withModel(initial: String? = fixture, backupFiles: any FileAccess = LocalFileAccess(), immediate: Bool? = false, _ body: @MainActor (AppModel, URL) throws -> Void) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("KubeConfigAppTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1534,6 +1534,86 @@ final class AppModelTests: XCTestCase {
             model.addEntry()
             XCTAssertEqual(model.draftStatus, "Edited")
         }
+    }
+}
+
+extension AppModelTests {
+    private static let numberedContexts = "contexts:\n- {name: item-10, context: {cluster: c}}\n- {name: item-2, context: {cluster: c}}\n"
+
+    func testUndoSelectsTheChangedEntryInListOrder() async throws {
+        try await withModel(initial: Self.numberedContexts) { model, _ in
+            model.selectEntry("item-2")
+            var next = try XCTUnwrap(model.document)
+            try next.update(.contexts, originalName: "item-10", name: "item-10", fields: ["namespace": "one"])
+            try model.stage(next)
+            model.undo()
+            XCTAssertEqual(model.selectedName, "item-10", "Only this one changed")
+
+            try next.update(.contexts, originalName: "item-2", name: "item-2", fields: ["namespace": "two"])
+            try model.stage(next)
+            model.selectEntry("item-10")
+            model.undo()
+            XCTAssertEqual(model.selectedName, "item-2", "Numbers sort as numbers, so 2 comes before 10")
+        }
+    }
+
+    func testImportFromAFileResolvesPathsBesideIt() async throws {
+        try await withModel { model, url in
+            let file = url.deletingLastPathComponent().appendingPathComponent("incoming.yaml")
+            try Data("clusters: [{name: new, cluster: {server: 'https://new.invalid', certificate-authority: ca.pem}}]\n".utf8).write(to: file)
+            try model.prepareImport(file: file)
+            XCTAssertTrue(model.showImport)
+            let path = try XCTUnwrap(model.importPlan?.incoming.entry(.clusters, named: "new")?.value("certificate-authority"))
+            XCTAssertEqual(path, file.deletingLastPathComponent().appendingPathComponent("ca.pem").standardizedFileURL.path)
+        }
+    }
+
+    func testImportFileMustExistAndBeUTF8() async throws {
+        try await withModel { model, url in
+            let folder = url.deletingLastPathComponent()
+            let binary = folder.appendingPathComponent("binary")
+            try Data([0xff, 0xfe, 0x00]).write(to: binary)
+            for file in [binary, folder.appendingPathComponent("absent")] {
+                XCTAssertThrowsError(try model.prepareImport(file: file)) {
+                    XCTAssertEqual($0 as? ConfigError, .invalid("Choose a UTF-8 kubeconfig file."))
+                }
+            }
+            XCTAssertFalse(model.showImport)
+        }
+    }
+
+    func testUnreadableBackupFolderEmptiesTheListAndReportsIt() async throws {
+        try await withModel { model, url in
+            model.addEntry()
+            model.commit()
+            XCTAssertEqual(model.records.count, 1)
+            let folder = model.store.backups.location(for: url)
+            try FileManager.default.removeItem(at: folder)
+            try Data().write(to: folder)
+            model.refreshBackups()
+            XCTAssertEqual(model.records, [])
+            XCTAssertNil(model.selectedBackupID)
+            XCTAssertNotNil(model.errorMessage)
+        }
+    }
+
+    func testRevealingBackupsBeforeThereAreAnySaysSo() async throws {
+        try await withModel { model, _ in
+            model.revealBackups()
+            XCTAssertEqual(model.draftStatus, "No backups yet")
+        }
+    }
+
+    func testPreviewColoringKeepsTheTextAndStopsAtTheLimit() {
+        let text = "# é😀\nkey: 'value' # note\nlist: [1, true]\n\n"
+        let colored = YAMLStyle.attributed(text)
+        XCTAssertEqual(String(colored.characters), text)
+        XCTAssertGreaterThan(colored.runs.count, 1)
+
+        let large = String(repeating: "k: v\n", count: YAMLStyle.highlightLimit / 5 + 1)
+        let plain = YAMLStyle.attributed(large)
+        XCTAssertEqual(plain.runs.count, 1)
+        XCTAssertEqual(plain.characters.count, large.count)
     }
 }
 

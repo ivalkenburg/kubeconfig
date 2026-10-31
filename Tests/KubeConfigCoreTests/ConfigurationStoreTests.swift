@@ -181,6 +181,39 @@ final class ConfigurationStoreTests: FileTestCase {
         XCTAssertFalse(try store.hasChanged(result.snapshot))
     }
 
+    func testChainOfDanglingSymlinksKeepsEveryLink() throws {
+        let first = directory.appendingPathComponent("first"), second = directory.appendingPathComponent("second")
+        try FileManager.default.createSymbolicLink(atPath: second.path, withDestinationPath: "target")
+        try FileManager.default.createSymbolicLink(atPath: first.path, withDestinationPath: "second")
+        let result = try store.apply(.empty, over: store.load(first), retention: 10)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: first.path), "second")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: second.path), "target")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("target").path))
+        XCTAssertFalse(try store.hasChanged(result.snapshot))
+    }
+
+    func testSymlinkLoopFailsToLoadInsteadOfHanging() throws {
+        let first = directory.appendingPathComponent("first"), second = directory.appendingPathComponent("second")
+        try FileManager.default.createSymbolicLink(atPath: first.path, withDestinationPath: "second")
+        try FileManager.default.createSymbolicLink(atPath: second.path, withDestinationPath: "first")
+        XCTAssertThrowsError(try store.load(first))
+    }
+
+    func testContextSwitchThroughARetargetedSymlinkIsAnExternalConflict() throws {
+        try Data(Self.twoContexts.utf8).write(to: config)
+        let link = directory.appendingPathComponent("linked-config")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: config)
+        let snapshot = try store.load(link)
+        let alternate = directory.appendingPathComponent("alternate")
+        try Data(Self.twoContexts.utf8).write(to: alternate)
+        try FileManager.default.removeItem(at: link)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: alternate)
+        XCTAssertThrowsError(try store.switchContext(to: "other", over: snapshot)) {
+            XCTAssertEqual($0 as? ConfigError, .externalChange)
+        }
+        XCTAssertEqual(try diskText(), Self.twoContexts)
+    }
+
     func testDamagedNeighborDoesNotTurnASavedBackupIntoAWarning() throws {
         try writeInitial()
         try FileManager.default.createDirectory(at: backups.location(for: config), withIntermediateDirectories: true)

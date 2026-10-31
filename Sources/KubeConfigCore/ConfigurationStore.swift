@@ -254,9 +254,13 @@ public struct ConfigurationStore {
 
     /// `resolvingSymlinksInPath` stops at a dangling link, and writing there would replace the link.
     private static func resolved(_ url: URL) -> URL {
-        let path = url.resolvingSymlinksInPath()
-        guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: path.path) else { return path }
-        return URL(fileURLWithPath: target, relativeTo: path.deletingLastPathComponent()).absoluteURL.standardizedFileURL
+        var path = url.resolvingSymlinksInPath()
+        // Bounded, because links that form a loop never arrive anywhere.
+        for _ in 0..<32 {
+            guard let target = try? FileManager.default.destinationOfSymbolicLink(atPath: path.path) else { break }
+            path = URL(fileURLWithPath: target, relativeTo: path.deletingLastPathComponent()).absoluteURL.resolvingSymlinksInPath()
+        }
+        return path
     }
 
     public func apply(_ document: KubeDocument, over snapshot: FileSnapshot, retention: Int) throws -> ApplyResult {
@@ -283,6 +287,7 @@ public struct ConfigurationStore {
     /// Returns nil when the file can't take the patch, leaving the switch to go through Apply.
     public func switchContext(to name: String, over snapshot: FileSnapshot) throws -> FileSnapshot? {
         guard let text = KubeDocument.settingCurrentContext(name, in: snapshot.text) else { return nil }
+        guard try !hasChanged(snapshot) else { throw ConfigError.externalChange }
         let data = Data(text.utf8)
         if data == snapshot.data { return snapshot }
         try files.replaceIfUnchanged(data, at: snapshot.resolvedURL, expectedContents: snapshot.data)

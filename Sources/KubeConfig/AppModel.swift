@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import KubeConfigCore
 import SwiftUI
 
@@ -62,6 +61,7 @@ final class AppModel: ObservableObject {
     @Published var snapshot: FileSnapshot? {
         didSet {
             diskDocument = snapshot.flatMap { $0.exists ? try? KubeDocument(yaml: $0.text) : nil }
+            serializedDisk = (try? diskDocument?.serialized()) ?? snapshot?.text ?? ""
             fileChangedOnDisk = false
         }
     }
@@ -96,6 +96,8 @@ final class AppModel: ObservableObject {
     private var loadedEditor: EntryEditor? { didSet { evaluation = nil } }
     private var afterApply: (() -> Void)?
     private var diskDocument: KubeDocument? { didSet { evaluation = nil } }
+    /// What each draft state is compared with, which is too slow to work out on every keystroke.
+    private var serializedDisk = ""
     /// Views read the issues and counts several times per update, so each draft state is evaluated once.
     private var evaluation: (issues: [String], changes: DraftChanges?, reviewCount: Int)?
     /// The draft when YAML editing began. The whole session becomes one undo step.
@@ -166,7 +168,7 @@ final class AppModel: ObservableObject {
     private var evaluated: (issues: [String], changes: DraftChanges?, reviewCount: Int) {
         if let evaluation { return evaluation }
         let preview = previewDocument
-        let reviewCount = preview.flatMap { try? ConfigurationDiff.changeCount(before: snapshot?.text ?? "", after: $0) } ?? 0
+        let reviewCount = preview.flatMap { try? ConfigurationDiff.changeCount(serializedBefore: serializedDisk, after: $0) } ?? 0
         let result = (parseIssue.map { [$0] } ?? preview?.validationIssues ?? [], preview?.changes(from: diskDocument), reviewCount)
         evaluation = result
         return result
@@ -327,9 +329,10 @@ final class AppModel: ObservableObject {
         statusMessage = nil
         clearEditor()
         guard !showRaw else { return }
-        let changed = section.kind.flatMap { kind in
-            document?.entries(kind).map(\.name).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-                .first { document?.entry(kind, named: $0) != previous?.entry(kind, named: $0) }
+        let changed = section.kind.flatMap { kind -> String? in
+            let old = Dictionary((previous?.entries(kind) ?? []).map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            return document?.entries(kind).filter { old[$0.name] != $0 }.map(\.name)
+                .min { $0.localizedStandardCompare($1) == .orderedAscending }
         }
         reselect(changed)
     }
@@ -666,6 +669,10 @@ final class AppModel: ObservableObject {
         panel.title = "Import Kubeconfig"
         panel.showsHiddenFiles = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        try prepareImport(file: url)
+    }
+
+    func prepareImport(file url: URL) throws {
         guard let data = try LocalFileAccess().read(url), let yaml = String(data: data, encoding: .utf8) else { throw ConfigError.invalid("Choose a UTF-8 kubeconfig file.") }
         try prepareImport(yaml: yaml, directory: url.deletingLastPathComponent())
     }

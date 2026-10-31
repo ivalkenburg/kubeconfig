@@ -244,19 +244,19 @@ struct MainView: View {
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
             if let warning = model.backupWarning {
-                NoticeBar(symbol: "exclamationmark.triangle", text: warning, tint: .orange) {
+                NoticeBar(text: warning) {
                     if model.recoveryContents != nil { Button("Export Previous…", action: model.exportRecovery) }
                 }
             }
             if model.fileChangedOnDisk {
-                NoticeBar(symbol: "exclamationmark.triangle", text: "This file changed outside KubeConfig. Reload to see the new version.", tint: .orange) {
+                NoticeBar(text: "This file changed outside KubeConfig. Reload to see the new version.") {
                     if model.hasPendingChanges { Button("Export Draft…", action: model.exportDraft) }
                     Button("Reload", action: model.reload)
                 }
             }
             if model.section == .backups, model.damagedBackupCount > 0 {
                 let count = model.damagedBackupCount
-                NoticeBar(symbol: "exclamationmark.triangle", text: "\(count) damaged backup\(count == 1 ? " isn’t" : "s aren’t") listed.", tint: .orange) {
+                NoticeBar(text: "\(count) damaged backup\(count == 1 ? " isn’t" : "s aren’t") listed.") {
                     Button("Reveal Folder", action: model.revealBackups)
                 }
             }
@@ -449,20 +449,18 @@ struct GlassIconGroup<Content: View>: View {
 }
 
 struct NoticeBar<Actions: View>: View {
-    let symbol: String
     let text: String
-    let tint: Color
     @ViewBuilder var actions: Actions
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: symbol).foregroundStyle(tint)
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
             // A fixed height here would have the window measure this wrapped at its narrowest, and overflow.
             Text(text).font(.callout)
             Spacer(minLength: 4)
             actions
         }
         .padding(14)
-        .background(tint.opacity(0.07))
+        .background(.orange.opacity(0.07))
         Divider()
     }
 }

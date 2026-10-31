@@ -10,7 +10,11 @@ public struct DiffLine: Identifiable, Equatable {
 public enum ConfigurationDiff {
     /// Compares serialized documents, so formatting alone doesn't bury the real changes.
     public static func lines(before: String, after: KubeDocument) throws -> [DiffLine] {
-        let old = try (try? KubeDocument(yaml: before))?.serialized() ?? before
+        try lines(serializedBefore: (try? KubeDocument(yaml: before))?.serialized() ?? before, after: after)
+    }
+
+    /// For comparing many drafts with one file, whose serialized text can be kept rather than parsed each time.
+    public static func lines(serializedBefore old: String, after: KubeDocument) throws -> [DiffLine] {
         let new = try after.serialized()
         let lhs = old.components(separatedBy: "\n")
         let rhs = new.components(separatedBy: "\n")
@@ -36,8 +40,8 @@ public enum ConfigurationDiff {
     }
 
     /// How many changes Review steps through, so Apply can name the same number.
-    public static func changeCount(before: String, after: KubeDocument) throws -> Int {
-        changes(in: try lines(before: before, after: after)).count
+    public static func changeCount(serializedBefore: String, after: KubeDocument) throws -> Int {
+        changes(in: try lines(serializedBefore: serializedBefore, after: after)).count
     }
 
     /// Runs of changed lines, as offsets into `lines`.

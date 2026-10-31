@@ -157,6 +157,30 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(try plan.merged(into: target).currentContext, "development-imported")
     }
 
+    func testActivationCannotPointAtASkippedContext() throws {
+        let target = try KubeDocument(yaml: Fixtures.yaml.replacingOccurrences(of: "namespace: default", with: "namespace: other"))
+        var plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
+        plan.activateImportedContext = true
+        plan.items[plan.items.firstIndex { $0.kind == .contexts && $0.originalName == "development" }!].action = .skip
+        XCTAssertThrowsError(try plan.merged(into: target)) { XCTAssertTrue($0.localizedDescription.contains("isn’t being imported")) }
+    }
+
+    func testActivationCannotPointAtAContextTheImportLacks() throws {
+        let target = try KubeDocument(yaml: "contexts: [{name: elsewhere, context: {}}]\n")
+        var plan = try ImportPlan(target: target, incoming: KubeDocument(yaml: "current-context: elsewhere\n"), sourceDirectory: nil)
+        plan.activateImportedContext = true
+        XCTAssertThrowsError(try plan.merged(into: target)) { XCTAssertTrue($0.localizedDescription.contains("isn’t being imported")) }
+    }
+
+    func testActivationAcceptsAReusedContext() throws {
+        let shared = "clusters: [{name: c, cluster: {server: 'https://c.invalid'}}]\ncontexts: [{name: shared, context: {cluster: c}}]\n"
+        let target = try KubeDocument(yaml: shared)
+        var plan = try ImportPlan(target: target, incoming: KubeDocument(yaml: shared + "current-context: shared\n"), sourceDirectory: nil)
+        plan.activateImportedContext = true
+        XCTAssertEqual(plan.items.last?.action, .reuse)
+        XCTAssertEqual(try plan.merged(into: target).currentContext, "shared")
+    }
+
     func testANullReferenceIsNotMistakenForAnEntryNamedNull() throws {
         let target = try KubeDocument(yaml: "users: [{name: 'null', user: {token: a}}]\n")
         let incoming = try KubeDocument(yaml: """

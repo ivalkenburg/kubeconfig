@@ -144,6 +144,24 @@ final class KubeDocumentTests: XCTestCase {
         try doc.validate()
     }
 
+    func testCredentialPluginNeedsACommand() throws {
+        for exec in ["{apiVersion: v1}", "{command: ''}", "{command: 5}"] {
+            let doc = try KubeDocument(yaml: "users: [{name: u, user: {exec: \(exec)}}]\n")
+            XCTAssertEqual(doc.validationIssues, ["Credential plugin in user ‘u’ needs a command string."], exec)
+        }
+    }
+
+    func testContextFieldsMustBeStrings() throws {
+        let doc = try KubeDocument(yaml: "clusters: [{name: c, cluster: {server: 'https://c.invalid'}}]\ncontexts: [{name: x, context: {cluster: c, namespace: 5}}]\n")
+        XCTAssertEqual(doc.validationIssues, ["Namespace in context ‘x’ must be a string."])
+    }
+
+    func testMappingKeysMustBeStrings() {
+        XCTAssertThrowsError(try KubeDocument(yaml: "vendor: {1: a}\n")) {
+            XCTAssertEqual($0 as? ConfigError, .invalid("YAML mapping keys must be strings."))
+        }
+    }
+
     func testDocumentLevelFieldsAreValidated() throws {
         let doc = try KubeDocument(yaml: "apiVersion: v2\nkind: Pod\ncurrent-context: 1\n")
         XCTAssertEqual(doc.validationIssues, ["apiVersion must be v1.", "kind must be Config.", "current-context must be a string.", "The active context ‘1’ does not exist."])
@@ -241,6 +259,14 @@ final class KubeDocumentTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("line"))
             XCTAssertFalse(error.localizedDescription.contains("fixture-secret-token"))
         }
+    }
+
+    func testKeptSerializedTextDiffsLikeTheFileItCameFrom() throws {
+        let before = "# a comment\n" + Fixtures.yaml
+        let doc = try Fixtures.changed()
+        let kept = try Fixtures.document().serialized()
+        XCTAssertEqual(try ConfigurationDiff.lines(serializedBefore: kept, after: doc), try ConfigurationDiff.lines(before: before, after: doc))
+        XCTAssertEqual(try ConfigurationDiff.changeCount(serializedBefore: kept, after: doc), 1)
     }
 
     func testDiffShowsCredentialsAndIgnoresFormattingOnly() throws {

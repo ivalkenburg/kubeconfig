@@ -329,8 +329,9 @@ public struct KubeDocument: Equatable {
     }
 
     private static func stringFieldIssues(_ entry: ConfigEntry, keys: [String]) -> [String] {
-        keys.compactMap { key in
-            guard let value = entry.fields[key], value.null == nil, value.tag != Tag(.str) else { return nil }
+        let fields = entry.fields
+        return keys.compactMap { key in
+            guard let value = fields[key], value.null == nil, value.tag != Tag(.str) else { return nil }
             return "\(key) in \(entry.kind.singular) ‘\(entry.name)’ must be a string."
         }
     }

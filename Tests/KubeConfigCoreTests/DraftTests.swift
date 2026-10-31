@@ -201,6 +201,25 @@ final class YAMLHighlighterTests: XCTestCase {
         ])
     }
 
+    func testTokensStayOrderedAndInBoundsOnArbitraryInput() {
+        let pieces = ["a", " ", "  ", "\n", "\r\n", ":", ": ", "- ", "#", " #", "'", "\"", "\\", "|", ">", "{", "}", "[", "]", ",", "---", "...", "1", "true", "é", "😀", "~"]
+        var state: UInt64 = 42
+        for _ in 0..<2000 {
+            var text = ""
+            for _ in 0..<40 {
+                state = state &* 6364136223846793005 &+ 1442695040888963407
+                text += pieces[Int((state >> 33) % UInt64(pieces.count))]
+            }
+            var offset = 0
+            for token in YAMLHighlighter.tokens(in: text) {
+                XCTAssertFalse(token.range.isEmpty, text)
+                XCTAssertGreaterThanOrEqual(token.range.lowerBound, offset, text)
+                offset = token.range.upperBound
+            }
+            XCTAssertLessThanOrEqual(offset, text.utf16.count, text)
+        }
+    }
+
     func testUnfinishedInputDoesNotCrash() {
         for text in ["", "\n", "-", "'", "\"open", "a: '", "a: [", "key:", "- - -", "? x", "\r\n", "a: |"] {
             _ = YAMLHighlighter.tokens(in: text)
