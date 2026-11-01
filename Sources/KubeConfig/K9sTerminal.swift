@@ -84,16 +84,14 @@ struct K9sDetailView: View {
         VStack(spacing: 0) {
             if case let .exited(code) = session.phase {
                 NoticeBar(text: code.map { "k9s exited with status \($0)." } ?? "k9s stopped unexpectedly.") {
-                    Button("Restart", action: model.restartK9s)
-                        .disabled(restartBlockReason != nil).help(restartBlockReason ?? "")
+                    restartButton("Restart")
                     Button("Back", action: model.closeK9s)
                 }
             }
             switch session.freshness {
             case .changed:
                 NoticeBar(text: "This context changed on disk, so k9s may be out of date.") {
-                    Button("Restart", action: model.restartK9s)
-                        .disabled(restartBlockReason != nil).help(restartBlockReason ?? "")
+                    restartButton("Restart")
                 }
             case .removed:
                 NoticeBar(text: "This context is no longer in the file.") {
@@ -109,8 +107,7 @@ struct K9sDetailView: View {
                 } actions: {
                     Text(Self.installCommand).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                     Button("Copy Command") { model.copyToPasteboard(Self.installCommand) }
-                    Button("Try Again", action: model.restartK9s).buttonStyle(.borderedProminent)
-                        .disabled(restartBlockReason != nil).help(restartBlockReason ?? "")
+                    restartButton("Try Again").buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -121,6 +118,10 @@ struct K9sDetailView: View {
         }
     }
 
-    private var restartBlockReason: String? { model.k9sRestartBlockReason }
+    private func restartButton(_ title: String) -> some View {
+        let blockReason = model.k9sRestartBlockReason
+        return Button(title, action: model.restartK9s).disabled(blockReason != nil).help(blockReason ?? "")
+    }
+
     private static let installCommand = "brew install k9s"
 }

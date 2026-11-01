@@ -72,6 +72,12 @@ final class DraftTests: XCTestCase {
         XCTAssertEqual(draft.changes(from: disk).count, 3)
     }
 
+    func testOneRemovedEntryExplainsOnlyOneIdenticalNewEntry() throws {
+        let disk = try KubeDocument(yaml: "clusters: [{name: a, cluster: {server: 'https://x.invalid'}}]\n")
+        let draft = try KubeDocument(yaml: "clusters: [{name: b, cluster: {server: 'https://x.invalid'}}, {name: c, cluster: {server: 'https://x.invalid'}}]\n")
+        XCTAssertEqual(draft.changes(from: disk).count(.clusters), 2, "One rename and one addition")
+    }
+
     func testRenamingAndEditingAnEntryStillCountsAsTwo() throws {
         let disk = try Fixtures.document()
         var draft = disk

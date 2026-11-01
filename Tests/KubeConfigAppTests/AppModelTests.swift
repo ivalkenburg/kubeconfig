@@ -2879,13 +2879,116 @@ extension AppModelTests {
         }
     }
 
-    func testHeaderShowsTheClusterK9sConnectedTo() async throws {
-        try await withK9s { model, _, _ in
+    func testSavedViewIsFoundThroughTheClusterOnDisk() async throws {
+        try await withK9s { model, url, terminals in
+            let moved = Self.fixture.replacingOccurrences(of: "- name: dev\n  cluster:", with: "- name: moved\n  cluster:")
+                .replacingOccurrences(of: "{cluster: dev, namespace: default}", with: "{cluster: moved, namespace: default}")
+            try moved.write(to: url, atomically: true, encoding: .utf8)
+            let saved = url.deletingLastPathComponent().appendingPathComponent("k9s/clusters/moved/dev")
+            try FileManager.default.createDirectory(at: saved, withIntermediateDirectories: true)
+            try "k9s:\n  view:\n    active: ctx\n".write(to: saved.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
             await self.open(model, "dev")
-            model.selectEntry("other")
-            model.selectEntry("dev")
-            XCTAssertEqual(model.k9sSession?.clusterName, "dev")
+            XCTAssertEqual(terminals.all.first?.launch?.arguments.suffix(2), ["--command", "pods"])
         }
+    }
+
+    func testReloadingADeletedFileEndsK9s() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "dev")
+            try FileManager.default.removeItem(at: url)
+            model.reload()
+            XCTAssertNil(model.k9sSession)
+            XCTAssertEqual(terminals.all.first?.stopped, true)
+        }
+    }
+
+    func testReloadingABlankedFileEndsK9s() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            try Data().write(to: url)
+            model.reload()
+            XCTAssertNil(model.k9sSession)
+        }
+    }
+
+    func testReloadingABrokenFileKeepsK9s() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            try "clusters: [".write(to: url, atomically: true, encoding: .utf8)
+            model.reload()
+            XCTAssertNotNil(model.k9sSession)
+        }
+    }
+
+    func testRestartReasons() async throws {
+        try await withK9s { model, url, _ in
+            XCTAssertEqual(model.k9sRestartBlockReason, "k9s isn’t open")
+            await self.open(model, "dev")
+            XCTAssertNil(model.k9sRestartBlockReason)
+            try FileManager.default.removeItem(at: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sRestartBlockReason, "This context is no longer in the file")
+        }
+    }
+
+    @MainActor private func render(_ view: some View) async throws -> NSWindow {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: view)
+        window.orderFront(nil)
+        try await Task.sleep(for: .milliseconds(50))
+        return window
+    }
+
+    func testK9sPaneAdoptsTheTerminalAndTakesItsFocusRequest() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            let window = try await self.render(K9sDetailView(model: model, session: XCTUnwrap(model.k9sSession)))
+            defer { window.orderOut(nil) }
+            XCTAssertTrue(terminals.all.first?.view.superview is K9sTerminalHost.Container)
+            XCTAssertFalse(model.takeK9sFocusRequest(), "The pane already used it")
+
+            let second = try await self.render(K9sDetailView(model: model, session: XCTUnwrap(model.k9sSession)))
+            defer { second.orderOut(nil) }
+            XCTAssertEqual(terminals.all.first?.view.window, second, "A new pane takes the terminal from the old one")
+        }
+    }
+
+    func testK9sPaneShowsAFailedOrMissingSession() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            terminals.all.first?.onExit?(1)
+            let window = try await self.render(K9sDetailView(model: model, session: XCTUnwrap(model.k9sSession)))
+            defer { window.orderOut(nil) }
+            XCTAssertEqual(terminals.all.first?.view.window, window, "The output stays on screen")
+        }
+        try await withK9s(k9sInstalled: false) { model, _, terminals in
+            await self.open(model, "dev")
+            let window = try await self.render(K9sDetailView(model: model, session: XCTUnwrap(model.k9sSession)))
+            defer { window.orderOut(nil) }
+            XCTAssertNil(terminals.all.first?.view.window, "There's no output to show")
+        }
+    }
+
+    func testTerminalRunsTheLaunchAndReportsItsExit() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("k9s")
+        try "#!/bin/sh\nexit 3\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let launch = try XCTUnwrap(K9sLaunch(kubeconfig: directory.appendingPathComponent("config"), context: "c", loginPath: directory.path, inherited: [:]))
+
+        let terminal = await K9sTerminalProcess()
+        await terminal.stop() // Closing during launch stops a terminal that hasn't started.
+        let exited = expectation(description: "exit")
+        let status = StatusBox()
+        await MainActor.run {
+            terminal.onExit = { status.value = $0; exited.fulfill() }
+            terminal.start(launch)
+        }
+        await fulfillment(of: [exited], timeout: 10)
+        XCTAssertEqual(status.value, 3)
     }
 
     func testReplacingCollapsesAndRestartKeepsExpand() async throws {
@@ -2981,6 +3084,8 @@ extension AppModelTests {
         return terminal
     }
 }
+
+private final class StatusBox: @unchecked Sendable { var value: Int32? }
 
 private struct UnwritableBackups: FileAccess {
     func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }

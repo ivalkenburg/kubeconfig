@@ -176,6 +176,15 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(nested?["new"]?.int, 2)
     }
 
+    func testImportAddsNoListsNeitherFileHas() throws {
+        let target = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nclusters:\n- name: a\n  cluster: {server: 'https://a.invalid'}\n")
+        let incoming = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nclusters:\n- name: b\n  cluster: {server: 'https://b.invalid'}\n")
+        let merged = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil).merged(into: target)
+        XCTAssertEqual(merged.entries(.clusters).map(\.name), ["a", "b"])
+        XCTAssertNil(merged.root["users"])
+        XCTAssertNil(merged.root["contexts"])
+    }
+
     func testReplaceAddsTheEntryWhenItIsNoLongerInTheDraft() throws {
         let doc = try KubeDocument(yaml: "clusters: [{name: dev, cluster: {server: 'https://dev.invalid'}}]")
         let changed = try KubeDocument(yaml: "clusters: [{name: dev, cluster: {server: 'https://new.invalid'}}]")

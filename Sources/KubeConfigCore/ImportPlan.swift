@@ -34,7 +34,7 @@ public struct ImportPlan {
         items = []
         var nameMaps: [EntryKind: [String: String]] = [:]
         for kind in EntryKind.importOrder {
-            var reserved = Set(target.entries(kind).map(\.name) + resolved.entries(kind).map(\.name))
+            let reserved = Set(target.entries(kind).map(\.name) + resolved.entries(kind).map(\.name))
             for entry in resolved.entries(kind) {
                 let existing = target.entry(kind, named: entry.name)
                 var comparable = entry.node
@@ -42,7 +42,6 @@ public struct ImportPlan {
                 let identical = existing?.node.isEquivalent(to: comparable) ?? false
                 // Proposed for identical entries too, in case Rename is chosen over reusing them.
                 let proposed = existing == nil ? entry.name : KubeDocument.uniqueName(entry.name + "-imported", isTaken: reserved.contains)
-                reserved.insert(proposed)
                 nameMaps[kind, default: [:]][entry.name] = identical ? entry.name : proposed
                 items.append(ImportItem(kind: kind, originalName: entry.name, conflicts: existing != nil,
                                         identical: identical, action: identical ? .reuse : .rename, destinationName: proposed))
@@ -84,7 +83,7 @@ public struct ImportPlan {
                     list.append(node)
                 }
             }
-            result.root[kind.rawValue] = Node(list)
+            if !list.isEmpty { result.root[kind.rawValue] = Node(list) }
         }
         // Retain imported top-level extension data as well as opaque entry fields.
         let standard: Set<String> = ["clusters", "users", "contexts", "current-context", "apiVersion", "kind"]

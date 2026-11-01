@@ -62,6 +62,14 @@ final class K9sLaunchTests: XCTestCase {
         }
     }
 
+    func testSavedViewsOfTheWrongShapeAreLeftToK9s() throws {
+        for contents in ["k9s:\n  view:\n    active: 12\n", "k9s:\n  view: []\n", "k9s: []\n", "- k9s\n", saved("''")] {
+            try withSavedView(contents) { environment in
+                XCTAssertFalse(K9sSavedView.isContextList(cluster: "c", context: "ctx", environment: environment), contents)
+            }
+        }
+    }
+
     func testContextWithoutAClusterIsLeftToK9s() throws {
         try withSavedView(saved("contexts"), cluster: "") { environment in
             XCTAssertFalse(K9sSavedView.isContextList(cluster: "", context: "ctx", environment: environment))
@@ -77,6 +85,9 @@ final class K9sLaunchTests: XCTestCase {
         XCTAssertEqual(path(["HOME": "/h", "XDG_DATA_HOME": "/data"]), "/data/k9s/\(names)")
         XCTAssertEqual(path(["HOME": "/h", "XDG_DATA_HOME": "/data", "K9S_CONFIG_DIR": "/k"]), "/k/\(names)")
         XCTAssertEqual(path(["HOME": "/h", "K9S_CONFIG_DIR": ""]), "/h/Library/Application Support/k9s/\(names)")
+        XCTAssertEqual(path(["HOME": "/h", "XDG_DATA_HOME": ""]), "/h/Library/Application Support/k9s/\(names)")
+        XCTAssertEqual(K9sSavedView.file(cluster: #"a\b"#, context: "c", environment: ["K9S_CONFIG_DIR": "/k"]).path,
+                       #"/k/clusters/a\b/c/config.yaml"#, "k9s only replaces colons and slashes")
     }
 
     func testProbeOutputIgnoresWhatStartupFilesPrint() {

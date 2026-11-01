@@ -248,6 +248,12 @@ final class KubeDocumentTests: XCTestCase {
         try doc.validate()
     }
 
+    func testRenamingAClusterAddsNoContextListTheFileLeftOut() throws {
+        var document = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nclusters:\n- name: a\n  cluster: {server: 'https://a.invalid'}\n")
+        try document.update(.clusters, originalName: "a", name: "b", fields: [:])
+        XCTAssertNil(document.root["contexts"])
+    }
+
     func testRenameActiveContextPreservesActivation() throws {
         var doc = try Fixtures.document()
         try doc.update(.contexts, originalName: "development", name: "renamed", fields: [:])
@@ -351,7 +357,7 @@ final class KubeDocumentTests: XCTestCase {
             try document.update(.clusters, originalName: "dev", name: "dev", fields: ["server": server])
             XCTAssertEqual(document.validationIssues, [], server)
         }
-        for server in ["ftp://cluster.example.invalid", "https://", "two words"] {
+        for server in ["ftp://cluster.example.invalid", "https://", "two words", "https://a.invalid/two words"] {
             var document = try Fixtures.document()
             try document.update(.clusters, originalName: "dev", name: "dev", fields: ["server": server])
             XCTAssertEqual(document.validationIssues.count, 1, server)

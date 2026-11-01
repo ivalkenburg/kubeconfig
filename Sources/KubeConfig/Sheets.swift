@@ -79,7 +79,7 @@ struct ReviewSheet: View {
     private func refresh() {
         do {
             guard let document = model.document else { return }
-            let lines = try ConfigurationDiff.lines(before: model.snapshot?.text ?? "", after: document)
+            let lines = try ConfigurationDiff.lines(serializedBefore: model.serializedDisk, after: document)
             coloredLines = lines.map { YAMLStyle.attributed($0.text.isEmpty ? " " : $0.text) }
             diff = lines
             changes = ConfigurationDiff.changes(in: diff)

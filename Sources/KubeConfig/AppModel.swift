@@ -53,8 +53,6 @@ struct K9sSession {
 
     let id = UUID()
     let contextName: String
-    let clusterName: String
-    let fileURL: URL
     let resolvedFileURL: URL
     let terminal: K9sTerminal
     /// The file as k9s first read it, which later versions are compared with.
@@ -156,7 +154,7 @@ final class AppModel: ObservableObject {
     private var afterApply: (() -> Void)?
     private var diskDocument: KubeDocument? { didSet { evaluation = nil } }
     /// What each draft state is compared with, which is too slow to work out on every keystroke.
-    private var serializedDisk = ""
+    private(set) var serializedDisk = ""
     private var evaluation: DraftEvaluation?
     /// The draft when YAML editing began. The whole session becomes one undo step.
     private var rawSessionStart: String?
@@ -690,8 +688,10 @@ final class AppModel: ObservableObject {
     }
 
     /// Selection moves on from a context that's gone, so nothing would show the session or let it be closed.
+    /// A file that needs repair says nothing about the context, unlike one that's missing or blank.
     private func closeK9sIfContextIsGone() {
-        if let k9sSession, let document, document.entry(.contexts, named: k9sSession.contextName) == nil { closeK9s() }
+        guard let k9sSession, parseIssue == nil, document?.entry(.contexts, named: k9sSession.contextName) == nil else { return }
+        closeK9s()
     }
 
     /// Whether the terminal should take focus when it next appears. Only asked-for k9s does.
@@ -704,13 +704,13 @@ final class AppModel: ObservableObject {
         let terminal = makeK9sTerminal()
         let baseline = latestDisk(changed: fileHasChanged).document
         let kubeconfig = snapshot.url
-        let session = K9sSession(contextName: name, clusterName: baseline?.entry(.contexts, named: name)?.value("cluster") ?? "",
-                                 fileURL: kubeconfig, resolvedFileURL: snapshot.resolvedURL, terminal: terminal, baseline: baseline)
+        let cluster = baseline?.entry(.contexts, named: name)?.value("cluster") ?? ""
+        let session = K9sSession(contextName: name, resolvedFileURL: snapshot.resolvedURL, terminal: terminal, baseline: baseline)
         let id = session.id
         k9sSession = session
         k9sWantsFocus = true
         terminal.onExit = { [weak self] code in self?.k9sExited(id, code: code) }
-        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sEnvironment, k9sLoginPath, cluster = session.clusterName] in
+        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sEnvironment, k9sLoginPath] in
             let loginPath: String?
             if let k9sLoginPath { loginPath = k9sLoginPath } else { loginPath = await findLoginPath() }
             guard let self else { return }

@@ -245,7 +245,7 @@ public struct KubeDocument: Equatable {
         root[kind.rawValue] = Node(list)
         if let originalName, originalName != trimmed {
             if kind == .contexts && currentContext == originalName { root["current-context"] = Self.string(trimmed) }
-            if kind != .contexts {
+            if kind != .contexts, !entries(.contexts).isEmpty {
                 var contexts = entries(.contexts).map(\.node)
                 for index in contexts.indices where contexts[index]["context"]?[kind.singular]?.text == originalName {
                     contexts[index]["context"]?[kind.singular] = Self.string(trimmed)

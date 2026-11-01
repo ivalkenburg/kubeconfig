@@ -181,6 +181,23 @@ final class ContextExportTests: FileTestCase {
         })
     }
 
+    func testTheSizeLimitCountsEncodedCertificatesAndTokens() throws {
+        let limit = KubeDocument.maximumByteCount
+        // Fits as raw bytes, but not once base64 adds a third.
+        XCTAssertThrowsError(try ContextExportPlan(document: Fixtures.document(), contextNames: ["development"], sourceDirectory: directory) { _ in
+            Data(repeating: 65, count: limit / 4 * 3 + 3)
+        }) { XCTAssertTrue($0.localizedDescription.contains("embedded files"), $0.localizedDescription) }
+
+        let withTokenFile = try KubeDocument(yaml: """
+        clusters: [{name: c, cluster: {server: 'https://c.invalid', certificate-authority: ca}}]
+        users: [{name: u, user: {tokenFile: token}}]
+        contexts: [{name: x, context: {cluster: c, user: u}}]
+        """)
+        XCTAssertThrowsError(try ContextExportPlan(document: withTokenFile, contextNames: ["x"], sourceDirectory: directory) { url in
+            Data(repeating: 65, count: url.lastPathComponent == "ca" ? limit / 2 : limit / 3)
+        }) { XCTAssertTrue($0.localizedDescription.contains("embedded files"), $0.localizedDescription) }
+    }
+
     func testDefaultReaderRejectsSparseOversizedFilesWithEntryAndPathContext() throws {
         let folder = directory.appendingPathComponent("certs")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

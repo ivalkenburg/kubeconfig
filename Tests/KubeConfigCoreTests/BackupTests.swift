@@ -13,6 +13,26 @@ final class BackupTests: FileTestCase {
         XCTAssertEqual(try backups.records(for: other).records.count, 1)
     }
 
+    func testBackupRootIsTightenedToTheOwner() throws {
+        try FileManager.default.createDirectory(at: backups.directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+        _ = try backups.savePrevious(Data("old".utf8), for: config, retention: 3)
+        let attributes = try FileManager.default.attributesOfItem(atPath: backups.directory.path)
+        XCTAssertEqual(attributes[.posixPermissions] as? Int, 0o700)
+    }
+
+    func testABackupRenamedOnDiskIsDamaged() throws {
+        let saved = try XCTUnwrap(backups.savePrevious(Data("old".utf8), for: config, retention: 3))
+        let folder = backups.location(for: config)
+        let renamed = UUID().uuidString
+        for suffix in ["json", "meta"] {
+            try FileManager.default.moveItem(at: folder.appendingPathComponent("\(saved.id).\(suffix)"),
+                                             to: folder.appendingPathComponent("\(renamed).\(suffix)"))
+        }
+        let listing = try backups.records(for: config)
+        XCTAssertEqual(listing.records, [])
+        XCTAssertEqual(listing.damagedCount, 1)
+    }
+
     func testReducedRetentionTakesEffectOnNextSuccessfulApply() throws {
         try writeInitial()
         var snapshot = try store.load(config)

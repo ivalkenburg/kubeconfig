@@ -46,7 +46,7 @@ public struct K9sLaunch {
 
 /// Reads the view k9s saved for a context, which it reopens on the next start. A context that failed to connect is
 /// saved on the context list, and would stay there after the connection recovers. Only ever reads k9s's files.
-public enum K9sSavedView {
+enum K9sSavedView {
     /// Follows k9s's own lookup: `K9S_CONFIG_DIR`, then `XDG_DATA_HOME`, then the macOS default.
     static func file(cluster: String, context: String, environment: [String: String]) -> URL {
         func directory(_ name: String) -> URL? {
@@ -60,7 +60,7 @@ public enum K9sSavedView {
     }
 
     /// False when there's no saved view or it can't be read, which leaves the choice to k9s.
-    public static func isContextList(cluster: String, context: String, environment: [String: String]) -> Bool {
+    static func isContextList(cluster: String, context: String, environment: [String: String]) -> Bool {
         guard !cluster.isEmpty,
               let text = try? String(contentsOf: file(cluster: cluster, context: context, environment: environment), encoding: .utf8),
               let saved = (try? Yams.load(yaml: text)) as? [String: Any],
@@ -151,7 +151,7 @@ extension KubeDocument {
     public static func connectionChange(ofContext name: String, from old: KubeDocument?, to new: KubeDocument?) -> ContextConnectionChange {
         guard let new, let newContext = new.entry(.contexts, named: name) else { return .removed }
         guard let old, let oldContext = old.entry(.contexts, named: name), oldContext.node.isEquivalent(to: newContext.node) else { return .changed }
-        for kind in [EntryKind.clusters, .users] {
+        for kind in EntryKind.referenced {
             let reference = newContext.value(kind.singular)
             let before = old.entry(kind, named: reference), after = new.entry(kind, named: reference)
             switch (before, after) {
