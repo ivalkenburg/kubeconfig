@@ -35,6 +35,12 @@ private struct DraftEvaluation {
     let reviewCount: Int
 }
 
+/// A draft in the undo history, and the active context it follows once restored, since switching leaves the file ahead of it.
+private struct DraftStep {
+    var text: String
+    var context: String?
+}
+
 struct EntryEditor: Equatable {
     let kind: EntryKind
     let originalName: String
@@ -62,7 +68,7 @@ final class AppModel: ObservableObject {
     @Published var section: AppSection = .contexts
     @Published var selectedName: String?
     @Published private(set) var selectedContextNames: Set<String> = [] {
-        didSet { contextSelectionGeneration &+= 1 }
+        didSet { if selectedContextNames != oldValue { contextSelectionGeneration &+= 1 } }
     }
     @Published var search = "" {
         didSet {
@@ -116,8 +122,8 @@ final class AppModel: ObservableObject {
     @Published var showImportSource = false
     @Published private(set) var contextExportPlan: ContextExportPlan?
     @Published var wrapsYAML: Bool { didSet { defaults.set(wrapsYAML, forKey: Self.wrapsYAMLKey) } }
-    @Published private var undoStack: [String] = []
-    @Published private var redoStack: [String] = []
+    @Published private var undoStack: [DraftStep] = []
+    @Published private var redoStack: [DraftStep] = []
     @Published var rawCanUndo = false
     @Published var rawCanRedo = false
     private var loadedEditor: EntryEditor? { didSet { evaluation = nil } }
@@ -289,8 +295,11 @@ final class AppModel: ObservableObject {
     }
 
     private func showEditor(for entry: ConfigEntry?) {
+        // A clean form doesn't affect the evaluation, and rebuilding it took 11 ms per click at 300 entries.
+        let kept = formIsDirty ? nil : evaluation
         editor = entry.map(EntryEditor.init)
         loadedEditor = editor
+        evaluation = kept
     }
 
     private func clearEditor() { showEditor(for: nil) }
@@ -323,7 +332,7 @@ final class AppModel: ObservableObject {
     }
 
     private func pushUndo(_ text: String) {
-        undoStack.append(text)
+        undoStack.append(DraftStep(text: text))
         if undoStack.count > Self.historyLimit { undoStack.removeFirst() }
     }
 
@@ -346,8 +355,8 @@ final class AppModel: ObservableObject {
         guard (try? flushEditor()) != nil else { editor = loadedEditor; return }
         endRawSession()
         guard let previous = undoStack.popLast() else { return }
-        redoStack.append(draftText)
-        restore(previous)
+        redoStack.append(DraftStep(text: draftText))
+        restore(following(previous))
     }
 
     func redo() {
@@ -359,7 +368,7 @@ final class AppModel: ObservableObject {
         guard (try? flushEditor()) != nil, let next = redoStack.popLast() else { return }
         endRawSession()
         pushUndo(draftText)
-        restore(next)
+        restore(following(next))
     }
 
     /// Undo for the toolbar and Edit menu. Text being typed, sheets, and other windows keep their own undo.
@@ -549,11 +558,15 @@ final class AppModel: ObservableObject {
         guard let written else { try stage(next, message: stagedMessage); return }
         // History holds whole drafts, so without this Undo would bring the old context back as a pending change.
         self.snapshot = written
-        undoStack = undoStack.map { draft($0, following: name) }
-        redoStack = redoStack.map { draft($0, following: name) }
+        undoStack = undoStack.map { DraftStep(text: $0.text, context: name) }
+        redoStack = redoStack.map { DraftStep(text: $0.text, context: name) }
         document = next
         draftText = draft(text, following: name)
         statusMessage = nil
+    }
+
+    private func following(_ step: DraftStep) -> String {
+        step.context.map { draft(step.text, following: $0) } ?? step.text
     }
 
     /// Keeps the file's own text when nothing differs, as `stage` does, so a matching draft leaves nothing to apply.
@@ -828,11 +841,12 @@ final class AppModel: ObservableObject {
 
     func rollbackSelected() {
         guard let backup = selectedBackup, let snapshot else { return }
-        resolvePendingChanges { [weak self] in
-            self?.reportingErrors {
+        reportingErrors {
+            // Read first, since applying pending changes can prune this very backup.
+            let record = try store.backups.record(backup, for: snapshot.resolvedURL)
+            let restored = try store.backups.rollbackText(record, for: snapshot.resolvedURL)
+            resolvePendingChanges { [weak self] in
                 guard let self else { return }
-                let record = try self.store.backups.record(backup, for: snapshot.resolvedURL)
-                let restored = try self.store.backups.rollbackText(record, for: snapshot.resolvedURL)
                 // Do not modify snapshot: it still represents the live file against which Apply must compare.
                 if restored != self.draftText { self.recordStep() }
                 self.draftText = restored

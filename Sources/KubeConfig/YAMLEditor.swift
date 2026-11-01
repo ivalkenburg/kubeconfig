@@ -111,6 +111,7 @@ struct YAMLEditor: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private weak var ruler: LineNumberRuler?
         private var wraps = false
+        private var shownText = ""
 
         init(model: AppModel) {
             self.model = model
@@ -141,11 +142,15 @@ struct YAMLEditor: NSViewRepresentable {
         /// Applies text from the model. Anything but the editor's own typing starts its undo over.
         func sync(text: String, errorLine: Int?) {
             guard let textView, let ruler else { return }
-            if textView.string != text {
+            if shownText != text {
+                shownText = text
                 textView.string = text
+                let base: [NSAttributedString.Key: Any] = [.font: Self.font, .foregroundColor: NSColor.labelColor]
+                textView.textStorage?.setAttributes(base, range: NSRange(location: 0, length: textView.textStorage?.length ?? 0))
+                textView.typingAttributes = base
                 textView.setSelectedRange(NSRange(location: 0, length: 0))
                 undo.removeAllActions()
-                highlight()
+                highlight(text)
                 DispatchQueue.main.async { [weak self] in
                     self?.publishUndoState()
                     self?.showLineStarts()
@@ -182,8 +187,11 @@ struct YAMLEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
-            highlight()
-            model.editRaw(textView.string)
+            // A native copy. The draft is compared several times per update, and comparing a bridged string took 1,000 times longer.
+            let text = String(decoding: Array(textView.string.utf8), as: UTF8.self)
+            shownText = text
+            highlight(text)
+            model.editRaw(text)
             publishUndoState()
         }
 
@@ -194,20 +202,16 @@ struct YAMLEditor: NSViewRepresentable {
             if model.rawCanRedo != undo.canRedo { model.rawCanRedo = undo.canRedo }
         }
 
-        private func highlight() {
-            guard let textView, let storage = textView.textStorage else { return }
-            let text = storage.string
-            let whole = NSRange(location: 0, length: storage.length)
-            storage.beginEditing()
-            storage.addAttributes([.font: Self.font, .foregroundColor: NSColor.labelColor], range: whole)
+        /// Temporary attributes, since changing the text storage laid out the whole file again on every keystroke.
+        private func highlight(_ text: String) {
+            guard let textView, let layout = textView.layoutManager, let storage = textView.textStorage else { return }
+            layout.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: storage.length))
             if text.utf8.count <= YAMLStyle.highlightLimit {
                 for token in YAMLHighlighter.tokens(in: text) {
-                    storage.addAttribute(.foregroundColor, value: YAMLStyle.color(token.kind), range: NSRange(token.range))
+                    layout.addTemporaryAttribute(.foregroundColor, value: YAMLStyle.color(token.kind), forCharacterRange: NSRange(token.range))
                 }
             }
-            storage.endEditing()
-            textView.typingAttributes = [.font: Self.font, .foregroundColor: NSColor.labelColor]
-            ruler?.textDidChange()
+            ruler?.textDidChange(text)
         }
     }
 }
@@ -231,9 +235,9 @@ final class LineNumberRuler: NSRulerView {
 
     @objc private func redraw() { needsDisplay = true }
 
-    func textDidChange() {
+    func textDidChange(_ text: String) {
         var starts = [0]
-        for (index, unit) in (textView?.string ?? "").utf16.enumerated() where unit == 10 { starts.append(index + 1) }
+        for (index, unit) in text.utf16.enumerated() where unit == 10 { starts.append(index + 1) }
         lineStarts = starts
         needsDisplay = true
     }

@@ -72,6 +72,11 @@ public struct KubeDocument: Equatable {
     public static let maximumByteCount = 16 * 1024 * 1024
     /// Counts aliases at every use, since a short file of nested aliases can otherwise expand without end.
     private static let maximumNodeCount = 1_000_000
+    /// kubectl reads dates, `12:30` and `=` as strings, so Yams' rules for them would refuse working files.
+    private static let resolver = try! Resolver.default.removing(.timestamp).removing(.value)
+        .replacing(.int, with: #"^(?:[-+]?0b[0-1_]+|[-+]?0o?[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|[-+]?0x[0-9a-fA-F_]+)$"#)
+        .replacing(.float, with: #"^(?:[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?|\.[0-9_]+(?:[eE][-+][0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$"#)
+
     public internal(set) var root: Node
 
     public init(yaml: String) throws {
@@ -79,7 +84,7 @@ public struct KubeDocument: Equatable {
         // Yams reads a byte order mark as content, which puts the first line out of step with the rest.
         let yaml = yaml.unicodeScalars.first == "\u{FEFF}" ? String(yaml.unicodeScalars.dropFirst()) : yaml
         do {
-            guard let parsed = try Yams.compose(yaml: yaml), parsed.mapping != nil else {
+            guard let parsed = try Yams.compose(yaml: yaml, Self.resolver), parsed.mapping != nil else {
                 throw ConfigError.invalid("A kubeconfig must be a YAML mapping.")
             }
             root = parsed
@@ -95,8 +100,8 @@ public struct KubeDocument: Equatable {
         }
         var nodeCount = 0
         try Self.checkMappings(root, depth: 0, nodeCount: &nodeCount)
-        // Rewriting the tree doubled parse time, and the draft is parsed on every keystroke.
-        if yaml.contains("!!str") { root = Self.keepingStrings(root) }
+        // Rewriting the tree doubled parse time, and the draft is parsed on every keystroke. Tags have forms besides `!!str`.
+        if yaml.utf8.contains(UInt8(ascii: "!")) { root = Self.keepingStrings(root) }
         for kind in EntryKind.allCases {
             guard let node = root[kind.rawValue], node.null == nil else { continue }
             guard node.sequence != nil else { throw ConfigError.invalid("\(kind.title) must be a YAML list.") }
@@ -184,6 +189,9 @@ public struct KubeDocument: Equatable {
         if !currentContext.isEmpty && !contexts.contains(where: { $0.name == currentContext }) {
             issues.append("The active context ‘\(currentContext)’ does not exist.")
         }
+        var tags = Set<String>()
+        Self.collectLostTags(in: root, into: &tags)
+        issues += tags.sorted().map { "The YAML tag \($0) would be lost when saving. Remove it in the YAML editor." }
         return issues
     }
 
@@ -313,8 +321,16 @@ public struct KubeDocument: Equatable {
         return name
     }
 
-    /// Quotes a string that would otherwise read back as a number, boolean, or null.
-    internal static func string(_ value: String) -> Node { .scalar(value.represented()) }
+    /// What kubectl's YAML parser reads as a number or boolean, once underscores are gone, while Yams reads a string.
+    private static let kubectlNonString = try! NSRegularExpression(
+        pattern: #"^(?:[yYnN]|[-+]?(?:0[bBoOxX][0-9a-fA-F]+|(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?))$"#)
+
+    /// Quotes a string that would otherwise read back as a number, boolean, or null, here or in kubectl, which refuses the whole file.
+    internal static func string(_ value: String) -> Node {
+        let digits = value.replacingOccurrences(of: "_", with: "")
+        let isAmbiguous = kubectlNonString.firstMatch(in: digits, range: NSRange(digits.startIndex..., in: digits)) != nil
+        return .scalar(isAmbiguous ? Node.Scalar(value, Tag(.str), .singleQuoted) : value.represented())
+    }
 
     /// The emitter drops a `!!str` tag, so `!!str 123` has to be quoted or it would read back as a number.
     private static func keepingStrings(_ node: Node) -> Node {
@@ -324,6 +340,27 @@ public struct KubeDocument: Equatable {
         if let sequence = node.sequence { return Node(sequence.map(keepingStrings), sequence.tag, sequence.style) }
         guard node.tag == Tag(.str), node.scalar?.style == .plain, let text = node.string else { return node }
         return string(text)
+    }
+
+    /// The emitter writes no tags, which changes the value: kubectl decodes `!!binary` and reads `!!int "5"` as a number.
+    /// Nodes built here carry the implicit tag, and no tag of their own.
+    private static let strTag = Tag(.str), mapTag = Tag(.map), seqTag = Tag(.seq), implicitTag = Tag(.implicit)
+
+    private static func collectLostTags(in node: Node, into tags: inout Set<String>) {
+        if let mapping = node.mapping {
+            if mapping.tag != mapTag, mapping.tag != implicitTag { tags.insert(displayName(of: mapping.tag)) }
+            for pair in mapping { collectLostTags(in: pair.value, into: &tags) }
+        } else if let sequence = node.sequence {
+            if sequence.tag != seqTag, sequence.tag != implicitTag { tags.insert(displayName(of: sequence.tag)) }
+            for value in sequence { collectLostTags(in: value, into: &tags) }
+        } else if let scalar = node.scalar, scalar.tag != strTag, scalar.tag != implicitTag {
+            let implied = scalar.style == .plain ? Tag(resolver.resolveTag(of: Node.scalar(Node.Scalar(scalar.string)))) : strTag
+            if scalar.tag != implied { tags.insert(displayName(of: scalar.tag)) }
+        }
+    }
+
+    private static func displayName(of tag: Tag) -> String {
+        tag.description.replacingOccurrences(of: "tag:yaml.org,2002:", with: "!!")
     }
 
     private static func checkSize(_ text: String) throws {

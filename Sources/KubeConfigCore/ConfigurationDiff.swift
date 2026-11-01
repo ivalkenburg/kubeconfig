@@ -16,8 +16,7 @@ public enum ConfigurationDiff {
     /// For comparing many drafts with one file, whose serialized text can be kept rather than parsed each time.
     public static func lines(serializedBefore old: String, after: KubeDocument) throws -> [DiffLine] {
         let new = try after.serialized()
-        let lhs = old.components(separatedBy: "\n")
-        let rhs = new.components(separatedBy: "\n")
+        let lhs = splitLines(old), rhs = splitLines(new)
         let difference = rhs.difference(from: lhs)
         var removals = Set<Int>(), insertions = Set<Int>()
         for change in difference {
@@ -37,6 +36,11 @@ public enum ConfigurationDiff {
             }
         }
         return result
+    }
+
+    /// `components(separatedBy:)` took most of `changeCount`, which runs on every keystroke.
+    private static func splitLines(_ text: String) -> [String] {
+        text.utf8.split(separator: 10, omittingEmptySubsequences: false).map { String(Substring($0)) }
     }
 
     /// How many changes Review steps through, so Apply can name the same number.

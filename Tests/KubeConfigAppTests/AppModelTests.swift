@@ -2171,6 +2171,70 @@ extension AppModelTests {
         }
     }
 
+    func testRollbackKeepsItsBackupWhenApplyingFirstPrunesIt() async throws {
+        try await withModel { model, _ in
+            model.defaults.set(2, forKey: BackupRetention.key)
+            for namespace in ["one", "two"] {
+                model.editor?.fields["namespace"] = namespace
+                model.requestReview()
+                model.commit()
+            }
+            XCTAssertEqual(model.records.count, 2)
+            model.editor?.fields["namespace"] = "three"
+            try model.flushEditor()
+            model.selectSection(.backups)
+            model.selectedBackupID = model.records.last?.id
+            model.ask = { _, _, _ in 0 }
+            model.rollbackSelected()
+            XCTAssertTrue(model.showReview)
+            model.commit()
+            XCTAssertNil(model.errorMessage)
+            XCTAssertEqual(model.draftText, Self.fixture)
+            XCTAssertEqual(model.statusMessage, "Rollback staged")
+        }
+    }
+
+    func testAQueuedSelectionSurvivesACommitThatKeepsTheSelection() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["namespace"] = "changed"
+            model.queueContextSelection(["other"])
+            model.commitForm()
+            await Task.yield()
+            try await Task.sleep(for: .milliseconds(20))
+            XCTAssertEqual(model.selectedContextNames, ["other"])
+        }
+    }
+
+    func testEditorColorsReachThePixelsAndFollowTheText() async throws {
+        try await withModel { model, _ in
+            model.toggleRawEditor()
+            let editor = EditorHarness(model: model)
+            editor.textView.frame = NSRect(x: 0, y: 0, width: 600, height: 300)
+            @MainActor func hasBlue() throws -> Bool {
+                let view = editor.textView
+                let bitmap = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                let rep = try XCTUnwrap(bitmap.converting(to: .sRGB, renderingIntent: .default))
+                for x in stride(from: 0, to: rep.pixelsWide, by: 1) {
+                    for y in stride(from: 0, to: rep.pixelsHigh, by: 1) {
+                        if let color = rep.colorAt(x: x, y: y), color.blueComponent > color.redComponent + 0.35 { return true }
+                    }
+                }
+                return false
+            }
+            XCTAssertTrue(try hasBlue(), "Keys are blue")
+            editor.textView.appearance = NSAppearance(named: .darkAqua)
+            XCTAssertTrue(try hasBlue(), "Keys are blue in dark mode too")
+            editor.textView.appearance = NSAppearance(named: .aqua)
+            model.editRaw("just words\n")
+            editor.coordinator.sync(text: model.draftText, errorLine: nil)
+            XCTAssertFalse(try hasBlue(), "Replaced text keeps no old color")
+            editor.type("key: value\n")
+            XCTAssertTrue(try hasBlue(), "Typing colors again")
+            XCTAssertEqual(editor.textView.font, YAMLEditor.Coordinator.font)
+        }
+    }
+
     func testBackupPreviewShowsContentsEvenWhenTheyAreNotUTF8() async throws {
         try await withModel { model, _ in
             let snapshot = try XCTUnwrap(model.snapshot)
@@ -2191,7 +2255,7 @@ extension AppModelTests {
 
     func testActionsReportAFormThatCannotBeCommitted() async throws {
         try await withModel { model, _ in
-            let actions: [(String, () -> Void)] = [
+            let actions: [(String, @MainActor () -> Void)] = [
                 ("selectEntry", { model.selectEntry("other") }),
                 ("selectSection", { model.selectSection(.clusters) }),
                 ("addEntry", model.addEntry),

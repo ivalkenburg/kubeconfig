@@ -80,6 +80,116 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertEqual(reloaded.entry(.users, named: "u")?.value("password"), "1234")
     }
 
+    func testValuesKubectlReadsAsOtherTypesAreQuoted() throws {
+        for value in ["y", "Y", "n", "N", "+.5", "-.5", "+.5e3", "-.5e1", "+_1", "-_1", "1_000", "0X1F", "0B11", "0O17", "-0b11", "yes", "on", "0x1F", ".5", "1e3"] {
+            var doc = try Fixtures.document()
+            try doc.update(.contexts, originalName: "development", name: "development", fields: ["namespace": value])
+            XCTAssertTrue(try doc.serialized().contains("namespace: '\(value)'"), value)
+            XCTAssertEqual(try KubeDocument(yaml: doc.serialized()).entry(.contexts, named: "development")?.value("namespace"), value)
+        }
+        let quoted = Fixtures.yaml + "contexts-extra: true\n"
+        let renamed = quoted.replacingOccurrences(of: "- name: development", with: "- name: 'n'").replacingOccurrences(of: "current-context: development", with: "current-context: ''")
+        XCTAssertTrue(try XCTUnwrap(KubeDocument.settingCurrentContext("n", in: renamed)).contains("current-context: 'n'"))
+    }
+
+    func testOrdinaryValuesStayPlain() throws {
+        for value in ["prod", "yellow", "no-such", "10.0.0.1", "1a", "0xZZ", "1.2.3", "-dash", "+plus", "_under"] {
+            var doc = try Fixtures.document()
+            try doc.update(.contexts, originalName: "development", name: "development", fields: ["namespace": value])
+            XCTAssertTrue(try doc.serialized().contains("namespace: \(value)\n"), value)
+        }
+    }
+
+    private func namedContext(_ value: String) -> String {
+        """
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - name: \(value)
+          cluster: {server: https://example.test}
+        users:
+        - name: \(value)
+          user: {}
+        contexts:
+        - name: \(value)
+          context: {cluster: \(value), user: \(value), namespace: \(value)}
+        current-context: \(value)
+        """ + "\n"
+    }
+
+    /// kubectl reads each of these as a string, where YAML 1.1 has dates and base-60 numbers.
+    func testDatesAndBase60ValuesAreStringsAsKubectlReadsThem() throws {
+        for value in ["2024-01-01", "2024-1-1 10:00:00", "2001-12-14t21:59:43.10-05:00", "12:30", "1:30:00", "+1:30", "-1:30", "1:30.5", "="] {
+            let yaml = namedContext(value)
+            let doc = try KubeDocument(yaml: yaml)
+            XCTAssertEqual(doc.validationIssues, [], value)
+            XCTAssertEqual(doc.currentContext, value)
+            XCTAssertEqual(doc.entries(.contexts).first?.name, value)
+            XCTAssertEqual(try doc.serialized().contains("current-context: \(value)\n"), true, value)
+            XCTAssertEqual(try KubeDocument(yaml: doc.serialized()), doc, value)
+        }
+    }
+
+    func testFormsStillQuoteDatesSoOtherParsersKeepThemStrings() throws {
+        var doc = try Fixtures.document()
+        try doc.update(.contexts, originalName: "development", name: "development", fields: ["namespace": "2024-01-01"])
+        XCTAssertTrue(try doc.serialized().contains("namespace: '2024-01-01'\n"))
+    }
+
+    func testValuesThatAreNumbersToBothParsersStayNumbers() throws {
+        let doc = try KubeDocument(yaml: "a: 12\nb: 1.5\nc: 0x1f\nd: true\ne: ~\n")
+        XCTAssertEqual(doc.root["a"]?.int, 12)
+        XCTAssertEqual(doc.root["b"]?.tag, Tag(.float))
+        XCTAssertEqual(doc.root["c"]?.tag, Tag(.int))
+        XCTAssertEqual(doc.root["d"]?.bool, true)
+        XCTAssertEqual(doc.root["e"]?.tag, Tag(.null))
+    }
+
+    func testTagsSerializationWouldLoseBlockApply() throws {
+        for (value, tag) in [("!!binary aGVsbG8=", "!!binary"), ("!custom foo", "!custom"), ("!!int \"5\"", "!!int"), ("!!timestamp 2024-01-01", "!!timestamp")] {
+            let doc = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nusers:\n- name: u\n  user:\n    extra: \(value)\n")
+            XCTAssertEqual(doc.validationIssues.count, 1, value)
+            XCTAssertTrue(doc.validationIssues.first?.contains(tag) == true, value)
+        }
+        let wrapped = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nvendor: !custom {a: 1}\nlist: !other [1]\n")
+        XCTAssertEqual(wrapped.validationIssues.count, 2)
+    }
+
+    func testTagsThatSurviveSerializationPassValidation() throws {
+        let yaml = """
+        apiVersion: v1
+        kind: Config
+        vendor: !!map
+          count: !!int 5
+          name: !!str 5
+          flag: !!bool true
+          empty: !!null
+          list: !!seq [!!str a]
+        """ + "\n"
+        XCTAssertEqual(try KubeDocument(yaml: yaml).validationIssues, [])
+    }
+
+    func testASwitchKeepsATagThatApplyWouldLose() throws {
+        let yaml = """
+        apiVersion: v1
+        kind: Config
+        contexts:
+        - {name: a, context: {}}
+        - {name: b, context: {}}
+        users:
+        - name: u
+          user: {token: !!binary aGVsbG8=}
+        current-context: a
+        """ + "\n"
+        XCTAssertEqual(KubeDocument.settingCurrentContext("b", in: yaml), yaml.replacingOccurrences(of: "current-context: a", with: "current-context: b"))
+    }
+
+    func testLongFormStringTagsStayStringsThroughSerialization() throws {
+        for yaml in ["a: !<tag:yaml.org,2002:str> 123\n", "%TAG !e! tag:yaml.org,2002:\n---\na: !e!str 123\n"] {
+            XCTAssertEqual(try KubeDocument(yaml: KubeDocument(yaml: yaml).serialized()).root["a"]?.tag, Tag(.str), yaml)
+        }
+    }
+
     func testAnExplicitStringTagLeavesTheOtherValuesTheirTypes() throws {
         let doc = try KubeDocument(yaml: "a: !!str 123\nb: 123\nc: true\nd: ~\n")
         let reloaded = try KubeDocument(yaml: doc.serialized())
@@ -357,6 +467,12 @@ final class KubeDocumentTests: XCTestCase {
         let value = String(repeating: "x", count: KubeDocument.maximumByteCount / 2 + 1)
         let lines = try ConfigurationDiff.lines(before: "a: &a \(value)\nb: *a\n", after: Fixtures.document())
         XCTAssertTrue(lines.contains { $0.change == .removed && $0.text == "b: *a" })
+    }
+
+    func testDiffSplitsLinesAtLineFeedsAlone() throws {
+        let before = "not yaml: [\r\nsecond\u{2028}part\n\nlast"
+        let lines = try ConfigurationDiff.lines(before: before, after: Fixtures.document())
+        XCTAssertEqual(lines.filter { $0.change == .removed }.map(\.text), ["not yaml: [\r", "second\u{2028}part", "last"])
     }
 
     func testDiffAgainstAMissingFileAddsEveryLine() throws {

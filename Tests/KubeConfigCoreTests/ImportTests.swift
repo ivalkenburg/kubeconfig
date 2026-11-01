@@ -1,4 +1,5 @@
 import XCTest
+import Yams
 @testable import KubeConfigCore
 
 final class ImportTests: XCTestCase {
@@ -135,6 +136,36 @@ final class ImportTests: XCTestCase {
         let filled = try KubeDocument(yaml: "preferences: {colors: true}\n")
         XCTAssertEqual(try ImportPlan(target: empty, incoming: filled, sourceDirectory: nil).merged(into: empty).root["preferences"]?["colors"]?.bool, true)
         XCTAssertEqual(try ImportPlan(target: filled, incoming: empty, sourceDirectory: nil).merged(into: filled).root["preferences"]?["colors"]?.bool, true)
+    }
+
+    func testAContextCannotLandOnAnEntryRenamedToASkippedName() throws {
+        let target = try KubeDocument(yaml: "clusters: [{name: a, cluster: {server: 'https://target.invalid'}}]")
+        let incoming = try KubeDocument(yaml: """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        contexts:
+        - {name: cb, context: {cluster: b}}
+        """)
+        var plan = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil)
+        plan.items[0].destinationName = "b"
+        plan.items[1].action = .skip
+        XCTAssertThrowsError(try plan.merged(into: target)) {
+            XCTAssertTrue(($0 as? ConfigError)?.errorDescription?.contains("cb") == true)
+        }
+        plan.items[2].action = .skip
+        let merged = try plan.merged(into: target)
+        XCTAssertEqual(merged.entry(.clusters, named: "b")?.value("server"), "https://a.invalid", "With nothing referring to it, the name is free")
+    }
+
+    func testMetadataKeysThatLookLikeOtherTypesKeepTheirIdentity() throws {
+        let target = try KubeDocument(yaml: "preferences: {\"123\": 1}\n\"yes\": 1\n")
+        let incoming = try KubeDocument(yaml: "preferences: {\"123\": 1, other: 2}\n\"yes\": 1\n\"456\": new\n")
+        let merged = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil).merged(into: target)
+        let reloaded = try KubeDocument(yaml: merged.serialized())
+        XCTAssertEqual(reloaded.root.mapping?.count, merged.root.mapping?.count)
+        XCTAssertEqual(reloaded.root["preferences"]?.mapping?.count, 2)
+        XCTAssertEqual(reloaded.root.mapping?[Node("456", Tag(.str))]?.string, "new")
     }
 
     func testMetadataMappingsCombineKeysFromBothFiles() throws {
