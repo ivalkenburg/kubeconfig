@@ -82,7 +82,7 @@ Sidebar navigation groups Contexts, Clusters, and Users under Configuration, and
 
 The toolbar leads with the current section, aligned to the list rows below it, and a line with the abbreviated file path, draft status, and an orange issue count that opens the issue list. A long path truncates in the middle, keeping the status and count, and the full path appears on hover. While the sidebar is hidden, the section title is a borderless menu of the same sections, split by a divider before Backups. Trailing groups, in order: Open, Import, and YAML; Undo and Redo; Discard; and Apply with its count. These controls stay visible when disabled so nothing shifts, and status belongs by the title rather than among them.
 
-YAML mode drops the entry list, gives the editor the full width, and adds a Wrap Lines toggle to the first toolbar group. Backups shares that setting through a wrap button in its header, tinted with the accent color while on.
+YAML mode drops the entry list, gives the editor the full width, and adds a Wrap Lines toggle in its own group before the other toolbar buttons. Backups shares that setting through a wrap button in its header, tinted with the accent color while on.
 
 Use the frontmatter spacing vocabulary for repeated custom regions. List rows pair medium-weight names with caption metadata. Sheet headers use the header inset; sheet action bars and preview areas commonly use the panel inset. Native grouped forms own their internal row metrics.
 
@@ -126,7 +126,7 @@ An `NSTextView` supports raw YAML, with syntax colors, a line-number gutter, a f
 
 ### k9s Terminal
 
-A SwiftTerm view replaces the entry form under a compact header: "Opened from" the context, its cluster, and Restart, Expand, and Close glass icon buttons. It is a code surface, so it stays solid. It is the one fixed-color surface in the app: k9s skins assume a dark terminal, so it stays dark in both appearances, in SF Mono at 12 points. Don't add a theme setting, since k9s skins own those colors.
+A SwiftTerm view replaces the entry form with no header, since k9s shows its live context itself. While it is on screen, Expand and Close form their own group before the other toolbar buttons, and Restart is in the View menu and the failure notices. It is a code surface, so it stays solid. It is the one fixed-color surface in the app: k9s skins assume a dark terminal, so it stays dark in both appearances, in SF Mono at 12 points. Don't add a theme setting, since k9s skins own those colors.
 
 ## Do's and Don'ts
 

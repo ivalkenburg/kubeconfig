@@ -29,6 +29,56 @@ final class K9sLaunchTests: XCTestCase {
         XCTAssertNil(K9sLaunch(kubeconfig: config, context: "c", loginPath: "/bin", inherited: ["PATH": "/usr/bin"]) { _ in false })
     }
 
+    private func withSavedView(_ contents: String?, cluster: String = "c", context: String = "ctx",
+                               body: ([String: String]) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = ["K9S_CONFIG_DIR": root.path]
+        if let contents {
+            let file = K9sSavedView.file(cluster: cluster, context: context, environment: environment)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try contents.write(to: file, atomically: true, encoding: .utf8)
+        }
+        try body(environment)
+    }
+
+    private func saved(_ active: String) -> String { "k9s:\n  view:\n    active: \(active)\n" }
+
+    func testSavedContextListOpensOnPods() throws {
+        for active in ["contexts", "context", "ctx", "contexts default"] {
+            try withSavedView(saved(active)) { environment in
+                let launch = try XCTUnwrap(K9sLaunch(kubeconfig: config, context: "ctx", cluster: "c", loginPath: "/b", inherited: environment) { _ in true })
+                XCTAssertEqual(Array(launch.arguments.suffix(2)), ["--command", "pods"], active)
+            }
+        }
+    }
+
+    func testOtherSavedViewsAreLeftToK9s() throws {
+        for contents in [saved("v1/pods default"), saved("apps/v1/deployments all"), "k9s: {}\n", "not: [valid", "", nil] as [String?] {
+            try withSavedView(contents) { environment in
+                let launch = try XCTUnwrap(K9sLaunch(kubeconfig: config, context: "ctx", cluster: "c", loginPath: "/b", inherited: environment) { _ in true })
+                XCTAssertEqual(launch.arguments.last, "--logoless")
+            }
+        }
+    }
+
+    func testContextWithoutAClusterIsLeftToK9s() throws {
+        try withSavedView(saved("contexts"), cluster: "") { environment in
+            XCTAssertFalse(K9sSavedView.isContextList(cluster: "", context: "ctx", environment: environment))
+        }
+    }
+
+    func testSavedViewFileFollowsK9sLookup() {
+        func path(_ environment: [String: String]) -> String {
+            K9sSavedView.file(cluster: "arn:aws:eks:x/y", context: "a::b", environment: environment).path
+        }
+        let names = "clusters/arn-aws-eks-x-y/a-b/config.yaml"
+        XCTAssertEqual(path(["HOME": "/h"]), "/h/Library/Application Support/k9s/\(names)")
+        XCTAssertEqual(path(["HOME": "/h", "XDG_DATA_HOME": "/data"]), "/data/k9s/\(names)")
+        XCTAssertEqual(path(["HOME": "/h", "XDG_DATA_HOME": "/data", "K9S_CONFIG_DIR": "/k"]), "/k/\(names)")
+        XCTAssertEqual(path(["HOME": "/h", "K9S_CONFIG_DIR": ""]), "/h/Library/Application Support/k9s/\(names)")
+    }
+
     func testProbeOutputIgnoresWhatStartupFilesPrint() {
         XCTAssertEqual(K9sLaunch.path(fromProbeOutput: "welcome!\n__KUBECONFIG_PATH__/a:/b\n__KUBECONFIG_PATH__bye"), "/a:/b")
         XCTAssertNil(K9sLaunch.path(fromProbeOutput: "no markers"))

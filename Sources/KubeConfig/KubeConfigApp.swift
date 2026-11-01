@@ -58,6 +58,8 @@ private struct DraftCommands: Commands {
             Button("Open in k9s") { model.openK9s() }
                 .keyboardShortcut("k", modifiers: [.command, .shift])
                 .disabled(model.k9sBlockReason(model.selectedName) != nil)
+            Button("Restart k9s", action: model.restartK9s)
+                .disabled(!model.k9sIsVisible || model.k9sRestartBlockReason != nil)
             // SidebarCommands stays disabled until something in the split view has focus.
             Button(model.sidebarIsCollapsed ? "Show Sidebar" : "Hide Sidebar", action: model.toggleSidebar)
                 .keyboardShortcut("s", modifiers: [.command, .control])

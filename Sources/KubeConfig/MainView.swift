@@ -58,6 +58,25 @@ struct MainView: View {
         ToolbarItem(placement: .navigation) { FileTitle(model: model) }
             .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.flexible, placement: .navigation)
+        if model.k9sIsVisible {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Toggle(isOn: $model.k9sIsExpanded) {
+                    Label(model.k9sIsExpanded ? "Show Lists" : "Expand k9s",
+                          systemImage: model.k9sIsExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                }
+                .help(model.k9sIsExpanded ? "Show Lists" : "Expand k9s")
+                Button(action: model.closeK9s) { Label("Close k9s", systemImage: "xmark") }
+                    .help("Close k9s")
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+        }
+        if model.showRaw {
+            ToolbarItem(placement: .primaryAction) {
+                Toggle(isOn: $model.wrapsYAML) { Label("Wrap Lines", systemImage: "arrow.turn.down.left") }
+                    .help("Wrap long lines")
+            }
+            ToolbarSpacer(.fixed, placement: .primaryAction)
+        }
         ToolbarItemGroup(placement: .primaryAction) {
             Button(action: model.openConfiguration) { Label("Open", systemImage: "folder") }
                 .help("Open a different kubeconfig (⌘O)")
@@ -69,10 +88,6 @@ struct MainView: View {
             }
             .help(model.showRaw ? "Return to the forms" : "Edit the complete configuration as YAML")
             .disabled(model.hasNoConfiguration && !model.showRaw)
-            if model.showRaw {
-                Toggle(isOn: $model.wrapsYAML) { Label("Wrap Lines", systemImage: "arrow.turn.down.left") }
-                    .help("Wrap long lines")
-            }
         }
         ToolbarSpacer(.fixed, placement: .primaryAction)
         ToolbarItemGroup(placement: .primaryAction) {

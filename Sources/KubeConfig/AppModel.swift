@@ -174,6 +174,7 @@ final class AppModel: ObservableObject {
     var makeK9sTerminal: () -> K9sTerminal = { K9sTerminalProcess() }
     var findLoginPath: () async -> String? = { await LoginShell.path() }
     var isK9sExecutable: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)
+    var k9sEnvironment = ProcessInfo.processInfo.environment
     private(set) var k9sLaunchTask: Task<Void, Never>?
     /// Kept for the run, since each lookup starts the user's shell. Try Again looks again.
     private var k9sLoginPath: String?
@@ -709,13 +710,13 @@ final class AppModel: ObservableObject {
         k9sSession = session
         k9sWantsFocus = true
         terminal.onExit = { [weak self] code in self?.k9sExited(id, code: code) }
-        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sLoginPath] in
+        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sEnvironment, k9sLoginPath, cluster = session.clusterName] in
             let loginPath: String?
             if let k9sLoginPath { loginPath = k9sLoginPath } else { loginPath = await findLoginPath() }
             guard let self else { return }
             self.k9sLoginPath = loginPath
             guard self.k9sSession?.id == id else { return }
-            if let launch = K9sLaunch(kubeconfig: kubeconfig, context: name, loginPath: loginPath, inherited: ProcessInfo.processInfo.environment, isExecutable: isK9sExecutable) {
+            if let launch = K9sLaunch(kubeconfig: kubeconfig, context: name, cluster: cluster, loginPath: loginPath, inherited: k9sEnvironment, isExecutable: isK9sExecutable) {
                 terminal.start(launch)
             } else {
                 self.k9sSession?.phase = .missing

@@ -2446,6 +2446,7 @@ extension AppModelTests {
             model.makeK9sTerminal = { terminals.make() }
             model.findLoginPath = { "/fake/bin" }
             model.isK9sExecutable = { k9sInstalled && $0 == "/fake/bin/k9s" }
+            model.k9sEnvironment = ["K9S_CONFIG_DIR": url.deletingLastPathComponent().appendingPathComponent("k9s").path]
             try await body(model, url, terminals)
         }
     }
@@ -2464,6 +2465,17 @@ extension AppModelTests {
             XCTAssertTrue(model.k9sIsVisible)
             XCTAssertEqual(model.document?.currentContext, "dev")
             XCTAssertFalse(model.hasPendingChanges)
+        }
+    }
+
+    func testK9sLeavesASavedContextList() async throws {
+        try await withK9s { model, url, terminals in
+            let cluster = try XCTUnwrap(model.document?.entry(.contexts, named: "other")?.value("cluster"))
+            let saved = url.deletingLastPathComponent().appendingPathComponent("k9s/clusters/\(cluster)/other")
+            try FileManager.default.createDirectory(at: saved, withIntermediateDirectories: true)
+            try "k9s:\n  view:\n    active: contexts\n".write(to: saved.appendingPathComponent("config.yaml"), atomically: true, encoding: .utf8)
+            await self.open(model, "other")
+            XCTAssertEqual(terminals.all.first?.launch?.arguments.suffix(2), ["--command", "pods"])
         }
     }
 

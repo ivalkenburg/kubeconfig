@@ -1,4 +1,5 @@
 import Foundation
+import Yams
 
 /// How to start k9s on one context of a file, without it depending on the active context.
 public struct K9sLaunch {
@@ -22,14 +23,16 @@ public struct K9sLaunch {
 
     /// Returns nil when k9s can't be found. Apps opened from Finder don't inherit the shell's `PATH`, so `loginPath`
     /// goes first and also reaches k9s itself, which needs it to find credential plugins.
-    public init?(kubeconfig: URL, context: String, loginPath: String?, inherited: [String: String],
+    /// `cluster` is the one the context points to, which k9s uses to find what it saved for the context.
+    public init?(kubeconfig: URL, context: String, cluster: String = "", loginPath: String?, inherited: [String: String],
                  isExecutable: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)) {
         var directories: [String] = []
         for directory in [loginPath, inherited["PATH"]].compactMap({ $0 }).flatMap({ $0.components(separatedBy: ":") }) + Self.fallbackDirectories
         where !directory.isEmpty && !directories.contains(directory) { directories.append(directory) }
         guard let executable = directories.map({ ($0 as NSString).appendingPathComponent("k9s") }).first(where: isExecutable) else { return nil }
         self.executable = executable
-        arguments = ["--kubeconfig", kubeconfig.path, "--context", context, "--splashless", "--logoless"]
+        let startingView = K9sSavedView.isContextList(cluster: cluster, context: context, environment: inherited) ? ["--command", "pods"] : []
+        arguments = ["--kubeconfig", kubeconfig.path, "--context", context, "--splashless", "--logoless"] + startingView
         var variables = inherited
         variables["PATH"] = directories.joined(separator: ":")
         variables["KUBECONFIG"] = kubeconfig.path
@@ -38,6 +41,37 @@ public struct K9sLaunch {
         // Apps opened from Finder have no locale, and terminal programs misjudge wide characters without one.
         if variables["LANG"] == nil { variables["LANG"] = "en_US.UTF-8" }
         environment = variables.map { "\($0.key)=\($0.value)" }.sorted()
+    }
+}
+
+/// Reads the view k9s saved for a context, which it reopens on the next start. A context that failed to connect is
+/// saved on the context list, and would stay there after the connection recovers. Only ever reads k9s's files.
+public enum K9sSavedView {
+    /// Follows k9s's own lookup: `K9S_CONFIG_DIR`, then `XDG_DATA_HOME`, then the macOS default.
+    static func file(cluster: String, context: String, environment: [String: String]) -> URL {
+        func directory(_ name: String) -> URL? {
+            environment[name].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+        }
+        let home = directory("HOME") ?? FileManager.default.homeDirectoryForCurrentUser
+        let root = directory("K9S_CONFIG_DIR")
+            ?? (directory("XDG_DATA_HOME") ?? home.appendingPathComponent("Library/Application Support")).appendingPathComponent("k9s")
+        return root.appendingPathComponent("clusters").appendingPathComponent(folderName(cluster))
+            .appendingPathComponent(folderName(context)).appendingPathComponent("config.yaml")
+    }
+
+    /// False when there's no saved view or it can't be read, which leaves the choice to k9s.
+    public static func isContextList(cluster: String, context: String, environment: [String: String]) -> Bool {
+        guard !cluster.isEmpty,
+              let text = try? String(contentsOf: file(cluster: cluster, context: context, environment: environment), encoding: .utf8),
+              let saved = (try? Yams.load(yaml: text)) as? [String: Any],
+              let k9s = saved["k9s"] as? [String: Any], let view = k9s["view"] as? [String: Any],
+              let active = view["active"] as? String else { return false }
+        // k9s saves a namespace after some views, as in "v1/pods default".
+        return ["contexts", "context", "ctx"].contains(active.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? "")
+    }
+
+    private static func folderName(_ name: String) -> String {
+        name.replacingOccurrences(of: "[:/]+", with: "-", options: .regularExpression)
     }
 }
 

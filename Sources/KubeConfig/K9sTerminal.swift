@@ -82,25 +82,10 @@ struct K9sDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Opened from \(session.contextName)").font(.headline).lineLimit(1).truncationMode(.middle)
-                    Text(session.clusterName.isEmpty ? "No cluster" : session.clusterName)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                }
-                Spacer()
-                GlassIconGroup {
-                    GlassIconButton(title: restartBlockReason ?? "Restart k9s", symbol: "arrow.clockwise", action: model.restartK9s)
-                        .disabled(restartBlockReason != nil)
-                    GlassIconButton(title: model.k9sIsExpanded ? "Show Lists" : "Expand k9s",
-                                    symbol: model.k9sIsExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                                    isOn: model.k9sIsExpanded) { model.k9sIsExpanded.toggle() }
-                    GlassIconButton(title: "Close k9s", symbol: "xmark", action: model.closeK9s)
-                }
-            }.padding(.horizontal, 24).padding(.vertical, 10)
-            Divider()
             if case let .exited(code) = session.phase {
                 NoticeBar(text: code.map { "k9s exited with status \($0)." } ?? "k9s stopped unexpectedly.") {
+                    Button("Restart", action: model.restartK9s)
+                        .disabled(restartBlockReason != nil).help(restartBlockReason ?? "")
                     Button("Back", action: model.closeK9s)
                 }
             }
