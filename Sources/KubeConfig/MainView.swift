@@ -9,11 +9,11 @@ struct MainView: View {
 
     var body: some View {
         // Keep the sidebar's split view alive when the editor changes modes.
-        NavigationSplitView(columnVisibility: $model.columnVisibility) {
+        NavigationSplitView(columnVisibility: model.displayedColumnVisibility) {
             sidebar
         } detail: {
             HSplitView {
-                if !model.showRaw {
+                if !model.showRaw && !model.k9sFillsWindow {
                     contentList
                         .frame(minWidth: 235, idealWidth: 275, maxWidth: 370)
                 }
@@ -173,6 +173,7 @@ struct MainView: View {
                     Button(model.contextExportTitle, action: model.requestContextExport).disabled(!model.canExportContexts)
                     Divider()
                     Button("Make Active") {}.disabled(true)
+                    Button("Open in k9s") {}.disabled(true)
                     Button("Duplicate") {}.disabled(true)
                     Button("Delete", role: .destructive) {}.disabled(true)
                 } else if let entry = entries.first(where: { names.contains($0.name) }) { entryMenu(entry) }
@@ -191,10 +192,16 @@ struct MainView: View {
 
     private func entryRows(_ entries: [ConfigEntry], changes: DraftChanges?) -> some View {
         ForEach(entries) { entry in
-            EntryRow(entry: entry, active: isActive(entry), changed: isChanged(entry, in: changes))
+            EntryRow(entry: entry, active: isActive(entry), changed: isChanged(entry, in: changes),
+                     k9sStatus: k9sStatus(entry))
                 .tag(entry.name)
                 .padding(.vertical, 5)
         }
+    }
+
+    private func k9sStatus(_ entry: ConfigEntry) -> String? {
+        guard entry.kind == .contexts, let session = model.k9sSession, session.contextName == entry.name else { return nil }
+        return session.phase == .running ? "k9s is running" : "k9s stopped"
     }
 
     private func isActive(_ entry: ConfigEntry) -> Bool {
@@ -212,6 +219,7 @@ struct MainView: View {
             } else {
                 Button("Make Active") { model.makeActive(entry.name) }
             }
+            Button("Open in k9s") { model.openK9s(entry.name) }.disabled(model.k9sBlockReason(entry.name) != nil)
             Divider()
         }
         Button("Duplicate") { model.duplicateEntry(entry.name) }
@@ -316,6 +324,8 @@ struct MainView: View {
                     }
                 } else if model.hasMultipleContextSelection {
                     ContextSelectionSummary(model: model)
+                } else if model.k9sIsVisible, let session = model.k9sSession {
+                    K9sDetailView(model: model, session: session)
                 } else if model.editor != nil {
                     EntryDetailView(model: model)
                 } else {
@@ -357,7 +367,7 @@ private struct FileTitle: View {
     }
 
     @ViewBuilder private var sectionTitle: some View {
-        if model.sidebarIsCollapsed {
+        if model.sidebarIsCollapsed || model.k9sFillsWindow {
             Menu {
                 ForEach(AppSection.configuration) { sectionToggle($0) }
                 Divider()
@@ -411,6 +421,7 @@ private struct EntryRow: View {
     let entry: ConfigEntry
     let active: Bool
     let changed: Bool
+    let k9sStatus: String?
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: entry.kind.symbol).foregroundStyle(active ? Color.accentColor : .secondary).padding(.top, 2)
@@ -419,6 +430,7 @@ private struct EntryRow: View {
                     Text(entry.name).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 0)
                     if changed { ChangeDot() }
+                    if let k9sStatus { Image(systemName: "terminal").foregroundStyle(.secondary).help(k9sStatus).accessibilityLabel(k9sStatus) }
                     if active { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor).help("Active in Draft").accessibilityLabel("Active in Draft") }
                 }
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)

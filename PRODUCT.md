@@ -20,7 +20,7 @@ Open the app, inspect or edit a kubeconfig, apply changes, and quit. Success mea
 
 ## Operating Context
 
-One file at a time, initially ~/.kube/config. Alternate files can be opened. No background agent, cluster connections, cloud login, or execution of credential plugins.
+One file at a time, initially ~/.kube/config. Alternate files can be opened. No background agent, cluster connections, cloud login, or execution of credential plugins by the app itself. The one exception is k9s, an external tool the user starts on a context, which connects and runs plugins in its own process.
 
 ## Capabilities and Constraints
 

@@ -17,6 +17,8 @@ struct EntryDetailView: View {
                         GlassIconButton(title: isActive ? "Clear Active Context" : "Make Active", symbol: isActive ? "checkmark.circle.fill" : "checkmark.circle", isOn: isActive) {
                             if isActive { model.clearActive() } else { model.makeActive() }
                         }
+                        GlassIconButton(title: k9sBlockReason ?? "Open in k9s (⇧⌘K)", symbol: "terminal") { model.openK9s() }
+                            .disabled(k9sBlockReason != nil)
                         GlassIconButton(title: model.contextExportTitle, symbol: "square.and.arrow.up", action: model.requestContextExport)
                             .disabled(!model.canExportContexts)
                     }
@@ -60,7 +62,7 @@ struct EntryDetailView: View {
                         textField("Password", key: "password")
                         textField("Token", key: "token")
                     } footer: {
-                        Text("Credential plugins are kept but never run.")
+                        Text("KubeConfig keeps credential plugins but never runs them. k9s runs them to connect.")
                     }
                     Section("Certificate files") {
                         pathField("Client certificate", key: "client-certificate")
@@ -103,6 +105,7 @@ struct EntryDetailView: View {
     private var kind: EntryKind { model.editor?.kind ?? .contexts }
     private var entry: ConfigEntry? { model.document?.entry(kind, named: model.editor?.originalName ?? "") }
     private var isActive: Bool { kind == .contexts && model.document?.currentContext == model.editor?.originalName }
+    private var k9sBlockReason: String? { model.k9sBlockReason(model.editor?.originalName) }
     private var blockedReason: String? { model.editor.flatMap { model.deleteBlockReason($0.originalName) } }
     private var nameBinding: Binding<String> {
         Binding(get: { model.editor?.name ?? "" }, set: { model.editor?.name = $0 })

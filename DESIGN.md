@@ -39,7 +39,7 @@ SwiftUI and AppKit own control rendering, keyboard focus, selection, materials, 
 - Actions that never move: Undo, Discard, and Apply stay in the toolbar.
 - Visible draft state and reviewable changes.
 
-This is the implemented system in Operate mode. Sources: `Sources/KubeConfig/{KubeConfigApp,MainView,EntryDetailView,Sheets,YAMLEditor}.swift`; real native captures live in `.impeccable/review/`. Measurements are macOS logical points, independent of screenshot pixel density. Frontmatter owns explicit reusable dimensions; platform-owned values remain semantic references in the sidecar.
+This is the implemented system in Operate mode. Sources: `Sources/KubeConfig/{KubeConfigApp,MainView,EntryDetailView,Sheets,YAMLEditor,K9sTerminal}.swift`; real native captures live in `.impeccable/review/`. Measurements are macOS logical points, independent of screenshot pixel density. Frontmatter owns explicit reusable dimensions; platform-owned values remain semantic references in the sidecar.
 
 ## Colors
 
@@ -118,16 +118,20 @@ Use `.grouped` `Form`, `Section`, `TextField`, `Picker`, and `LabeledContent`. C
 
 ### Notices and Empty States
 
-`NoticeBar` combines an SF Symbol, wrapping callout text, optional actions, tint wash, and divider. Warnings include explanatory text. Notices cover a failed backup, a file changed outside the app, and damaged backups. `ContentUnavailableView` supplies missing-file, repair, unselected, and history states with contextual actions.
+`NoticeBar` combines an SF Symbol, wrapping callout text, optional actions, tint wash, and divider. Warnings include explanatory text. Notices cover a failed backup, a file changed outside the app, damaged backups, a failed k9s, and a k9s session that's out of date. `ContentUnavailableView` supplies missing-file, repair, unselected, and history states with contextual actions.
 
 ### YAML, Diffs, and Review Sheets
 
 An `NSTextView` supports raw YAML, with syntax colors, a line-number gutter, a find bar, optional line wrapping, and a red marker on the parse error line. Previews use selectable, syntax-colored monospaced text and two-axis scrolling. Diff lines retain +/− prefixes and status tint. Use an eager stack for wrapped diff lines, since a lazy stack's height estimates make scrolling jump. Review groups neighboring changed lines into steps: circular glass up and down buttons move between them, and the current step takes a stronger tint. Sheets separate explanation, scrollable content, and bottom actions with dividers; Cancel and the confirmation action use native keyboard behavior.
 
+### k9s Terminal
+
+A SwiftTerm view replaces the entry form under a compact header: "Opened from" the context, its cluster, and Restart, Expand, and Close glass icon buttons. It is a code surface, so it stays solid. It is the one fixed-color surface in the app: k9s skins assume a dark terminal, so it stays dark in both appearances, in SF Mono at 12 points. Don't add a theme setting, since k9s skins own those colors.
+
 ## Do's and Don'ts
 
 ### Do:
-- Do use semantic SwiftUI/AppKit colors and verify both macOS appearances.
+- Do use semantic SwiftUI/AppKit colors and verify both macOS appearances. The k9s terminal is the one exception.
 - Do preserve native focus, keyboard shortcuts, disabled states, and accessible action labels.
 - Do keep search available for contexts, clusters, users, and backups, including clear-search and empty-result states.
 - Do pair warnings and diff colors with symbols, text, or change prefixes.

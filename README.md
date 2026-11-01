@@ -8,7 +8,8 @@ Editing `~/.kube/config` by hand means merging YAML from each provider, fixing
 name clashes, and hoping a typo doesn't lock you out of a cluster. KubeConfig
 stages your edits as a draft, shows a diff of the whole file, and saves the
 previous file as a backup on every Apply. It never connects to a cluster or runs
-a credential plugin.
+a credential plugin itself. If you have k9s installed, you can open a context in
+it right in the window.
 
 ![KubeConfig reviewing a staged change](screenshot.png)
 

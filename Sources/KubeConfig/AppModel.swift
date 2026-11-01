@@ -33,12 +33,34 @@ private struct DraftEvaluation {
     let issues: [String]
     let changes: DraftChanges?
     let reviewCount: Int
+    let preview: KubeDocument?
 }
 
 /// A draft in the undo history, and the active context it follows once restored, since switching leaves the file ahead of it.
 private struct DraftStep {
     var text: String
     var context: String?
+}
+
+/// The running k9s. Only one exists at a time, and it keeps running while other entries are on screen.
+struct K9sSession {
+    enum Phase: Equatable {
+        case running
+        case missing
+        /// It ended with an error, and the terminal stays up so its output can be read.
+        case exited(Int32?)
+    }
+
+    let id = UUID()
+    let contextName: String
+    let clusterName: String
+    let fileURL: URL
+    let resolvedFileURL: URL
+    let terminal: K9sTerminal
+    /// The file as k9s first read it, which later versions are compared with.
+    let baseline: KubeDocument?
+    var phase = Phase.running
+    var freshness = ContextConnectionChange.unchanged
 }
 
 struct EntryEditor: Equatable {
@@ -94,6 +116,7 @@ final class AppModel: ObservableObject {
             diskDocument = snapshot.flatMap { $0.exists ? try? KubeDocument(yaml: $0.text) : nil }
             serializedDisk = (try? diskDocument?.serialized()) ?? snapshot?.text ?? ""
             fileChangedOnDisk = false
+            refreshK9sFreshness(disk: diskDocument, fileIsGone: snapshot?.exists != true)
         }
     }
     /// The file differs from the loaded snapshot. Reloading stays the user's choice.
@@ -122,6 +145,9 @@ final class AppModel: ObservableObject {
     @Published var showImportSource = false
     @Published private(set) var contextExportPlan: ContextExportPlan?
     @Published var wrapsYAML: Bool { didSet { defaults.set(wrapsYAML, forKey: Self.wrapsYAMLKey) } }
+    @Published private(set) var k9sSession: K9sSession?
+    /// Hides the sidebar and list for k9s, without touching the sidebar preference.
+    @Published var k9sIsExpanded = false
     @Published private var undoStack: [DraftStep] = []
     @Published private var redoStack: [DraftStep] = []
     @Published var rawCanUndo = false
@@ -145,6 +171,13 @@ final class AppModel: ObservableObject {
     let store: ConfigurationStore
     let defaults: UserDefaults
     private(set) var launchOptions: LaunchOptions?
+    var makeK9sTerminal: () -> K9sTerminal = { K9sTerminalProcess() }
+    var findLoginPath: () async -> String? = { await LoginShell.path() }
+    var isK9sExecutable: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)
+    private(set) var k9sLaunchTask: Task<Void, Never>?
+    /// Kept for the run, since each lookup starts the user's shell. Try Again looks again.
+    private var k9sLoginPath: String?
+    private var k9sWantsFocus = false
 
     init(store: ConfigurationStore = ConfigurationStore(), defaults: UserDefaults = .standard, initialURL: URL? = nil,
          arguments: [String] = ProcessInfo.processInfo.arguments) {
@@ -187,9 +220,10 @@ final class AppModel: ObservableObject {
     var pendingChanges: DraftChanges? { evaluated.changes }
     /// The changes Review will step through, which can differ from the entries that changed.
     var reviewCount: Int { evaluated.reviewCount }
-    var canUndo: Bool { !undoStack.isEmpty || formIsDirty || rawCanUndo || hasRawSessionEdits }
+    /// Undo stays off while k9s is up, since the draft it would change isn't on screen.
+    var canUndo: Bool { !k9sIsVisible && (!undoStack.isEmpty || formIsDirty || rawCanUndo || hasRawSessionEdits) }
     var canRedo: Bool { !redoStack.isEmpty || rawCanRedo }
-    var canRedoCommand: Bool { canRedo || fieldCanRedo }
+    var canRedoCommand: Bool { !k9sIsVisible && (canRedo || fieldCanRedo) }
     private var fieldCanRedo: Bool { !showRaw && (NSApp.keyWindow?.firstResponder as? NSText)?.undoManager?.canRedo == true }
     var nameError: String? {
         guard let editor, formIsDirty else { return nil }
@@ -203,13 +237,23 @@ final class AppModel: ObservableObject {
     /// With the sidebar gone, the toolbar title takes over choosing the section.
     var sidebarIsCollapsed: Bool { columnVisibility == .detailOnly }
     func toggleSidebar() { columnVisibility = sidebarIsCollapsed ? .all : .detailOnly }
+    var k9sIsVisible: Bool {
+        guard let k9sSession else { return false }
+        return section == .contexts && !showRaw && selectedName == k9sSession.contextName && document != nil
+    }
+    var k9sFillsWindow: Bool { k9sIsVisible && k9sIsExpanded }
+    /// What the window shows, which Expand overrides without changing the preference.
+    var displayedColumnVisibility: Binding<NavigationSplitViewVisibility> {
+        Binding(get: { [self] in k9sFillsWindow ? .detailOnly : columnVisibility },
+                set: { [self] in if !k9sFillsWindow { columnVisibility = $0 } })
+    }
     private var hasRawSessionEdits: Bool { rawSessionStart.map { $0 != draftText } ?? false }
     private var evaluated: DraftEvaluation {
         if let evaluation { return evaluation }
         let preview = previewDocument
         let reviewCount = preview.flatMap { try? ConfigurationDiff.changeCount(serializedBefore: serializedDisk, after: $0) } ?? 0
         let result = DraftEvaluation(issues: parseIssue.map { [$0] } ?? preview?.validationIssues ?? [],
-                                     changes: preview?.changes(from: diskDocument), reviewCount: reviewCount)
+                                     changes: preview?.changes(from: diskDocument), reviewCount: reviewCount, preview: preview)
         evaluation = result
         return result
     }
@@ -237,6 +281,18 @@ final class AppModel: ObservableObject {
         let count = document.referencingContexts(kind, name: name).count
         return count == 0 ? nil : "Used by \(count) context\(count == 1 ? "" : "s")"
     }
+    /// Why k9s can't open a context. It reads the file, so it would miss pending changes to what the context connects with.
+    func k9sBlockReason(_ name: String?) -> String? {
+        guard !sheetIsOpen, !showRaw, section == .contexts, !hasMultipleContextSelection, let name else { return "Select a single context" }
+        // A bad name can't be previewed, and flushing it would raise an alert on every click behind the terminal.
+        if nameError != nil, name == editor?.originalName { return "Fix the name to open in k9s" }
+        guard let preview = evaluated.preview else { return "Repair the configuration to open in k9s" }
+        return KubeDocument.connectionChange(ofContext: name, from: preview, to: diskDocument) == .unchanged ? nil : "Apply changes to open in k9s"
+    }
+    var k9sRestartBlockReason: String? {
+        guard let k9sSession else { return "k9s isn’t open" }
+        return k9sSession.freshness == .removed ? "This context is no longer in the file" : k9sBlockReason(k9sSession.contextName)
+    }
     var selectedBackup: BackupSummary? { visibleBackups.first { $0.id == selectedBackupID } }
     var visibleBackups: [BackupSummary] {
         guard !search.isEmpty else { return records }
@@ -261,6 +317,8 @@ final class AppModel: ObservableObject {
     func load(_ url: URL) {
         reportingErrors {
             let loaded = try store.load(url)
+            if k9sSession?.resolvedFileURL != loaded.resolvedURL { closeK9s() }
+            let keepsK9sOnScreen = k9sIsVisible
             snapshot = loaded
             if loaded.exists { noteRecentFile(loaded.url) }
             draftText = loaded.text
@@ -270,6 +328,8 @@ final class AppModel: ObservableObject {
             clearHistory()
             selectFirstEntry()
             refreshBackups()
+            closeK9sIfContextIsGone()
+            if keepsK9sOnScreen, let name = k9sSession?.contextName { selectEntry(name) }
         }
     }
 
@@ -595,6 +655,95 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func openK9s(_ requested: String? = nil) {
+        guard let name = requested ?? selectedName, k9sBlockReason(name) == nil else { return }
+        if selectedName != name || selectedContextNames != [name] { selectEntry(name) }
+        guard selectedName == name, let snapshot else { return }
+        if let k9sSession, k9sSession.contextName == name {
+            let view = k9sSession.terminal.view
+            if let window = view.window { window.makeFirstResponder(view) } else { k9sWantsFocus = true }
+        } else {
+            closeK9s()
+            startK9s(context: name, snapshot: snapshot)
+        }
+    }
+
+    func restartK9s() {
+        guard let k9sSession, k9sRestartBlockReason == nil, let snapshot else { return }
+        if k9sSession.phase == .missing { k9sLoginPath = nil }
+        endK9s()
+        startK9s(context: k9sSession.contextName, snapshot: snapshot)
+    }
+
+    func closeK9s() {
+        endK9s()
+        k9sIsExpanded = false
+    }
+
+    private func endK9s() {
+        if let terminal = k9sSession?.terminal {
+            terminal.onExit = nil
+            terminal.stop()
+        }
+        k9sSession = nil
+    }
+
+    /// Selection moves on from a context that's gone, so nothing would show the session or let it be closed.
+    private func closeK9sIfContextIsGone() {
+        if let k9sSession, let document, document.entry(.contexts, named: k9sSession.contextName) == nil { closeK9s() }
+    }
+
+    /// Whether the terminal should take focus when it next appears. Only asked-for k9s does.
+    func takeK9sFocusRequest() -> Bool {
+        defer { k9sWantsFocus = false }
+        return k9sWantsFocus
+    }
+
+    private func startK9s(context name: String, snapshot: FileSnapshot) {
+        let terminal = makeK9sTerminal()
+        let baseline = latestDisk(changed: fileHasChanged).document
+        let kubeconfig = snapshot.url
+        let session = K9sSession(contextName: name, clusterName: baseline?.entry(.contexts, named: name)?.value("cluster") ?? "",
+                                 fileURL: kubeconfig, resolvedFileURL: snapshot.resolvedURL, terminal: terminal, baseline: baseline)
+        let id = session.id
+        k9sSession = session
+        k9sWantsFocus = true
+        terminal.onExit = { [weak self] code in self?.k9sExited(id, code: code) }
+        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sLoginPath] in
+            let loginPath: String?
+            if let k9sLoginPath { loginPath = k9sLoginPath } else { loginPath = await findLoginPath() }
+            guard let self else { return }
+            self.k9sLoginPath = loginPath
+            guard self.k9sSession?.id == id else { return }
+            if let launch = K9sLaunch(kubeconfig: kubeconfig, context: name, loginPath: loginPath, inherited: ProcessInfo.processInfo.environment, isExecutable: isK9sExecutable) {
+                terminal.start(launch)
+            } else {
+                self.k9sSession?.phase = .missing
+            }
+        }
+    }
+
+    private func k9sExited(_ id: UUID, code: Int32?) {
+        guard k9sSession?.id == id else { return }
+        if code == 0 { closeK9s() } else { k9sSession?.phase = .exited(code) }
+    }
+
+    private var fileHasChanged: Bool { snapshot.map { (try? store.hasChanged($0)) ?? true } ?? false }
+
+    /// The file as it is now, which can be newer than the loaded snapshot. The document is nil if the file is gone or unreadable.
+    private func latestDisk(changed: Bool) -> (document: KubeDocument?, isGone: Bool) {
+        guard changed, let snapshot else { return (diskDocument, false) }
+        guard let loaded = try? store.load(snapshot.url) else { return (nil, false) }
+        return (loaded.exists ? try? KubeDocument(yaml: loaded.text) : nil, !loaded.exists)
+    }
+
+    /// A file that can't be read says nothing about the context, so that only counts as a change.
+    private func refreshK9sFreshness(disk: KubeDocument?, fileIsGone: Bool) {
+        guard let k9sSession else { return }
+        guard disk != nil || fileIsGone else { self.k9sSession?.freshness = .changed; return }
+        self.k9sSession?.freshness = KubeDocument.connectionChange(ofContext: k9sSession.contextName, from: k9sSession.baseline, to: disk)
+    }
+
     /// Shows an alert and returns the index of the chosen button.
     var ask: (_ message: String, _ detail: String, _ buttons: [String]) -> Int = { message, detail, buttons in
         let alert = NSAlert()
@@ -665,6 +814,7 @@ final class AppModel: ObservableObject {
             showReview = false
             clearHistory()
             refreshBackups()
+            closeK9sIfContextIsGone()
             let action = afterApply; afterApply = nil
             // Keep the recovery export available if writing the backup failed.
             if result.warning == nil { action?() }
@@ -745,8 +895,13 @@ final class AppModel: ObservableObject {
 
     /// Runs when the app comes forward, since nothing else notices a file changing while it's in the background.
     func checkForExternalChange() {
-        guard let snapshot else { return }
-        fileChangedOnDisk = (try? store.hasChanged(snapshot)) ?? true
+        guard snapshot != nil else { return }
+        let changed = fileHasChanged
+        fileChangedOnDisk = changed
+        if k9sSession != nil {
+            let disk = latestDisk(changed: changed)
+            refreshK9sFreshness(disk: disk.document, fileIsGone: disk.isGone)
+        }
     }
 
     func toggleRawEditor() {

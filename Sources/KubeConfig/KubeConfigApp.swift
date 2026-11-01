@@ -55,16 +55,20 @@ private struct DraftCommands: Commands {
         CommandGroup(after: .toolbar) {
             Toggle("Wrap Lines", isOn: $model.wrapsYAML).disabled(!model.showRaw && model.section != .backups)
             Divider()
+            Button("Open in k9s") { model.openK9s() }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
+                .disabled(model.k9sBlockReason(model.selectedName) != nil)
             // SidebarCommands stays disabled until something in the split view has focus.
             Button(model.sidebarIsCollapsed ? "Show Sidebar" : "Hide Sidebar", action: model.toggleSidebar)
                 .keyboardShortcut("s", modifiers: [.command, .control])
+                .disabled(model.k9sFillsWindow)
         }
         CommandGroup(replacing: .undoRedo) {
             Button("Undo", action: model.undoCommand).keyboardShortcut("z").disabled(!model.canUndo && !model.sheetIsOpen)
             Button("Redo", action: model.redoCommand).keyboardShortcut("z", modifiers: [.command, .shift]).disabled(!model.canRedoCommand && !model.sheetIsOpen)
         }
         CommandGroup(after: .textEditing) {
-            Button("Find…", action: model.find).keyboardShortcut("f").disabled(model.sheetIsOpen)
+            Button("Find…", action: model.find).keyboardShortcut("f").disabled(model.sheetIsOpen || model.k9sIsVisible)
             Group {
                 Button("Find Next") { model.performFind(.nextMatch) }.keyboardShortcut("g")
                 Button("Find Previous") { model.performFind(.previousMatch) }.keyboardShortcut("g", modifiers: [.command, .shift])
@@ -84,6 +88,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         model.resolvePendingChanges { DispatchQueue.main.async { sender.terminate(nil) } }
         return .terminateCancel
     }
+    func applicationWillTerminate(_ notification: Notification) { model?.closeK9s() }
 }
 
 private struct WindowBridge: NSViewRepresentable {
@@ -109,7 +114,7 @@ private struct WindowBridge: NSViewRepresentable {
             super.init()
             // SwiftUI refreshes menu items when a menu opens, so shortcuts would otherwise act on stale enabled states.
             menuSync = model.objectWillChange.debounce(for: .milliseconds(30), scheduler: RunLoop.main).sink { _ in
-                for title in ["File", "Edit"] {
+                for title in ["File", "Edit", "View"] {
                     if let menu = NSApp.mainMenu?.item(withTitle: title)?.submenu { menu.delegate?.menuNeedsUpdate?(menu) }
                 }
             }

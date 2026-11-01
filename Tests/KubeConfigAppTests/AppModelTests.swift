@@ -2439,6 +2439,537 @@ extension AppModelTests {
     }
 }
 
+extension AppModelTests {
+    @MainActor private func withK9s(k9sInstalled: Bool = true, immediate: Bool? = false, _ body: @MainActor (AppModel, URL, FakeK9sTerminals) async throws -> Void) async throws {
+        try await withModel(immediate: immediate) { model, url in
+            let terminals = FakeK9sTerminals()
+            model.makeK9sTerminal = { terminals.make() }
+            model.findLoginPath = { "/fake/bin" }
+            model.isK9sExecutable = { k9sInstalled && $0 == "/fake/bin/k9s" }
+            try await body(model, url, terminals)
+        }
+    }
+
+    @MainActor private func open(_ model: AppModel, _ name: String? = nil) async {
+        model.openK9s(name)
+        await model.k9sLaunchTask?.value
+    }
+
+    func testK9sOpensTheSelectedContextOfTheOpenFile() async throws {
+        try await withK9s { model, url, terminals in
+            model.selectEntry("other")
+            await self.open(model)
+            XCTAssertEqual(terminals.all.first?.launch?.executable, "/fake/bin/k9s")
+            XCTAssertEqual(terminals.all.first?.launch?.arguments, ["--kubeconfig", url.path, "--context", "other", "--splashless", "--logoless"])
+            XCTAssertTrue(model.k9sIsVisible)
+            XCTAssertEqual(model.document?.currentContext, "dev")
+            XCTAssertFalse(model.hasPendingChanges)
+        }
+    }
+
+    func testK9sOpensAContextOtherThanTheSelectedOne() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "other")
+            XCTAssertEqual(model.selectedName, "other")
+            XCTAssertEqual(terminals.all.first?.launch?.arguments.dropFirst(3).first, "other")
+        }
+    }
+
+    func testK9sKeepsRunningWhileOtherEntriesAreOnScreen() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            model.selectEntry("other")
+            XCTAssertFalse(model.k9sIsVisible)
+            XCTAssertNotNil(model.editor)
+            model.selectSection(.clusters)
+            XCTAssertFalse(model.k9sIsVisible)
+            model.selectSection(.contexts)
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sIsVisible)
+            XCTAssertEqual(terminals.all.count, 1)
+            XCTAssertFalse(terminals.all[0].stopped)
+
+            await self.open(model, "dev")
+            XCTAssertEqual(terminals.all.count, 1)
+        }
+    }
+
+    func testOpeningAnotherContextReplacesTheSession() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            let first = terminals.all[0], exit = first.onExit
+            await self.open(model, "other")
+            XCTAssertTrue(first.stopped)
+            XCTAssertEqual(model.k9sSession?.contextName, "other")
+            exit?(1)
+            XCTAssertEqual(model.k9sSession?.phase, .running)
+        }
+    }
+
+    func testK9sIsBlockedByPendingChangesToItsConnection() async throws {
+        try await withK9s { model, _, terminals in
+            model.selectEntry("dev")
+            model.editor?.fields["namespace"] = "edited"
+            XCTAssertNotNil(model.k9sBlockReason("dev"), "A form still being typed in counts")
+            XCTAssertNil(model.k9sBlockReason("other"))
+            await self.open(model, "dev")
+            XCTAssertTrue(terminals.all.isEmpty)
+            model.commitForm()
+            XCTAssertNotNil(model.k9sBlockReason("dev"))
+
+            model.discardDraft()
+            model.selectSection(.clusters)
+            model.selectEntry("dev")
+            model.editor?.fields["server"] = "https://edited.invalid"
+            model.commitForm()
+            model.selectSection(.contexts)
+            XCTAssertNotNil(model.k9sBlockReason("dev"), "Both contexts use the changed cluster")
+            XCTAssertNotNil(model.k9sBlockReason("other"))
+        }
+    }
+
+    func testK9sIsBlockedForAContextThatIsOnlyInTheDraft() async throws {
+        try await withK9s { model, _, _ in
+            model.addEntry()
+            XCTAssertEqual(model.k9sBlockReason(model.selectedName), "Apply changes to open in k9s")
+            XCTAssertNil(model.k9sBlockReason("dev"), "An unrelated new context doesn't block")
+        }
+    }
+
+    func testK9sIsBlockedForSeveralContexts() async throws {
+        try await withK9s { model, _, _ in
+            model.selectContexts(["dev", "other"])
+            XCTAssertNotNil(model.k9sBlockReason("dev"))
+        }
+    }
+
+    func testCleanK9sExitReturnsToTheForm() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            model.k9sIsExpanded = true
+            terminals.all[0].onExit?(0)
+            XCTAssertNil(model.k9sSession)
+            XCTAssertFalse(model.k9sIsExpanded)
+            XCTAssertNotNil(model.editor)
+        }
+    }
+
+    func testFailedK9sKeepsItsOutputOnScreen() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            terminals.all[0].onExit?(1)
+            XCTAssertEqual(model.k9sSession?.phase, .exited(1))
+            XCTAssertTrue(model.k9sIsVisible)
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertEqual(terminals.all.count, 2)
+            XCTAssertEqual(model.k9sSession?.phase, .running)
+            XCTAssertNotNil(terminals.all[1].launch)
+        }
+    }
+
+    func testMissingK9sCanBeRetriedAfterInstalling() async throws {
+        try await withK9s(k9sInstalled: false) { model, _, terminals in
+            await self.open(model, "dev")
+            XCTAssertEqual(model.k9sSession?.phase, .missing)
+            XCTAssertNil(terminals.all[0].launch)
+            model.isK9sExecutable = { $0 == "/fake/bin/k9s" }
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertEqual(model.k9sSession?.phase, .running)
+        }
+    }
+
+    func testK9sNoticesItsContextChangingOnDisk() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            try Data(Self.fixture.replacingOccurrences(of: "other", with: "another").utf8).write(to: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .unchanged, "Only the context, cluster and user count")
+
+            try Data(Self.fixture.replacingOccurrences(of: "https://dev.invalid", with: "https://new.invalid").utf8).write(to: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .changed)
+
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertEqual(model.k9sSession?.freshness, .unchanged)
+
+            try Data(Self.fixture.replacingOccurrences(of: "name: dev\n  context", with: "name: renamed\n  context").utf8).write(to: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .removed)
+        }
+    }
+
+    func testApplyingAChangeMarksK9sOutOfDate() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            model.selectEntry("other")
+            model.selectSection(.clusters)
+            model.selectEntry("dev")
+            model.editor?.fields["server"] = "https://new.invalid"
+            model.commitForm()
+            model.commit()
+            XCTAssertEqual(model.k9sSession?.freshness, .changed)
+        }
+    }
+
+    func testOpeningAnotherFileEndsK9sButReloadingDoesNot() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "dev")
+            model.load(url)
+            XCTAssertNotNil(model.k9sSession)
+            XCTAssertFalse(terminals.all[0].stopped)
+
+            let otherFile = url.deletingLastPathComponent().appendingPathComponent("second")
+            try Data(Self.fixture.utf8).write(to: otherFile)
+            model.load(otherFile)
+            XCTAssertNil(model.k9sSession)
+            XCTAssertTrue(terminals.all[0].stopped)
+        }
+    }
+
+    func testExpandingK9sLeavesTheSidebarPreferenceAlone() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            model.k9sIsExpanded = true
+            XCTAssertEqual(model.displayedColumnVisibility.wrappedValue, .detailOnly)
+            XCTAssertEqual(model.columnVisibility, .all)
+            XCTAssertFalse(model.sidebarIsCollapsed)
+
+            model.selectEntry("other")
+            XCTAssertFalse(model.k9sFillsWindow)
+            XCTAssertEqual(model.displayedColumnVisibility.wrappedValue, .all)
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sFillsWindow)
+            model.closeK9s()
+            XCTAssertEqual(model.displayedColumnVisibility.wrappedValue, .all)
+        }
+    }
+
+    func testUndoStaysOffWhileK9sIsOnScreen() async throws {
+        try await withK9s { model, _, _ in
+            model.selectEntry("other")
+            model.editor?.fields["namespace"] = "edited"
+            model.commitForm()
+            XCTAssertTrue(model.canUndo)
+            await self.open(model, "dev")
+            XCTAssertFalse(model.canUndo)
+            model.selectEntry("other")
+            XCTAssertTrue(model.canUndo)
+        }
+    }
+
+    func testClosingDuringLaunchNeverStartsK9s() async throws {
+        try await withK9s { model, _, terminals in
+            let gate = LaunchGate()
+            model.findLoginPath = { await gate.wait(); return "/fake/bin" }
+            model.openK9s("dev")
+            let launch = model.k9sLaunchTask
+            model.closeK9s()
+            gate.open()
+            await launch?.value
+            XCTAssertNil(terminals.all[0].launch)
+            XCTAssertNil(model.k9sSession)
+        }
+    }
+
+    func testReplacingDuringLaunchStartsOnlyTheNewContext() async throws {
+        try await withK9s { model, _, terminals in
+            let gate = LaunchGate()
+            model.findLoginPath = { await gate.wait(); return "/fake/bin" }
+            model.openK9s("dev")
+            let first = model.k9sLaunchTask
+            model.openK9s("other")
+            let second = model.k9sLaunchTask
+            gate.open()
+            await first?.value
+            await second?.value
+            XCTAssertNil(terminals.all[0].launch)
+            XCTAssertEqual(terminals.all[1].launch?.arguments.dropFirst(3).first, "other")
+        }
+    }
+
+    func testRestartDuringLaunchStartsOnce() async throws {
+        try await withK9s { model, _, terminals in
+            let gate = LaunchGate()
+            model.findLoginPath = { await gate.wait(); return "/fake/bin" }
+            model.openK9s("dev")
+            let first = model.k9sLaunchTask
+            model.restartK9s()
+            let second = model.k9sLaunchTask
+            gate.open()
+            await first?.value
+            await second?.value
+            XCTAssertNil(terminals.all[0].launch)
+            XCTAssertNotNil(terminals.all[1].launch)
+        }
+    }
+
+    func testExitFromARestartedSessionIsIgnored() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            let exit = terminals.all[0].onExit
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            exit?(1)
+            XCTAssertEqual(model.k9sSession?.phase, .running)
+        }
+    }
+
+    func testSignalledExitKeepsTheOutput() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            terminals.all[0].onExit?(nil)
+            XCTAssertEqual(model.k9sSession?.phase, .exited(nil))
+        }
+    }
+
+    func testLoginPathIsKeptUntilTryAgain() async throws {
+        try await withK9s(k9sInstalled: false) { model, _, _ in
+            var lookups = 0
+            model.findLoginPath = { await MainActor.run { lookups += 1 }; return "/fake/bin" }
+            await self.open(model, "dev")
+            await self.open(model, "other")
+            XCTAssertEqual(lookups, 1)
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertEqual(lookups, 2, "Try Again might follow a change to the shell's PATH")
+        }
+    }
+
+    func testK9sStaysVisibleAfterReloading() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "other")
+            model.k9sIsExpanded = true
+            model.load(url)
+            XCTAssertTrue(model.k9sIsVisible)
+            XCTAssertTrue(model.k9sFillsWindow)
+            XCTAssertFalse(terminals.all[0].stopped)
+        }
+    }
+
+    func testReloadWithoutItsContextEndsK9s() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "other")
+            try Data(Self.fixture.replacingOccurrences(of: "name: other", with: "name: renamed").utf8).write(to: url)
+            model.load(url)
+            XCTAssertNil(model.k9sSession)
+            XCTAssertTrue(terminals.all[0].stopped)
+        }
+    }
+
+    func testApplyingDeletionOfK9sContextEndsTheSession() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "other")
+            model.deleteEntry("other")
+            model.commit()
+            XCTAssertNil(model.k9sSession)
+            XCTAssertTrue(terminals.all[0].stopped)
+        }
+    }
+
+    func testInvalidFileIsNotReportedAsRemoved() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            try Data("not: [valid".utf8).write(to: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .changed)
+            XCTAssertNil(model.k9sRestartBlockReason)
+        }
+    }
+
+    func testDeletedFileIsReportedAsRemoved() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            try FileManager.default.removeItem(at: url)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .removed)
+            XCTAssertNotNil(model.k9sRestartBlockReason)
+        }
+    }
+
+    func testBadNameBlocksK9s() async throws {
+        try await withK9s { model, _, terminals in
+            model.selectEntry("dev")
+            model.editor?.name = "other"
+            XCTAssertNotNil(model.k9sBlockReason("dev"))
+            await self.open(model, "dev")
+            XCTAssertTrue(terminals.all.isEmpty)
+        }
+    }
+
+    func testRestartIsBlockedByPendingChanges() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            model.selectSection(.clusters)
+            model.selectEntry("dev")
+            model.editor?.fields["server"] = "https://edited.invalid"
+            model.commitForm()
+            model.selectSection(.contexts)
+            model.selectEntry("dev")
+            XCTAssertNotNil(model.k9sRestartBlockReason)
+            model.restartK9s()
+            XCTAssertEqual(terminals.all.count, 1)
+            XCTAssertFalse(terminals.all[0].stopped)
+        }
+    }
+
+    func testFailedFlushStopsOpeningK9s() async throws {
+        try await withK9s { model, _, terminals in
+            model.selectEntry("dev")
+            model.editor?.name = "other"
+            await self.open(model, "other")
+            XCTAssertTrue(terminals.all.isEmpty)
+            XCTAssertEqual(model.selectedName, "dev")
+            XCTAssertNotNil(model.errorMessage)
+        }
+    }
+
+    func testFailedLoadKeepsK9s() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "dev")
+            let broken = url.deletingLastPathComponent().appendingPathComponent("broken")
+            try Data([0xFF, 0xFE, 0xFD]).write(to: broken)
+            model.load(broken)
+            XCTAssertNotNil(model.k9sSession)
+            XCTAssertFalse(terminals.all[0].stopped)
+        }
+    }
+
+    func testSameFileThroughSymlinkKeepsK9s() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "dev")
+            let link = url.deletingLastPathComponent().appendingPathComponent("link")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: url)
+            model.load(link)
+            XCTAssertNotNil(model.k9sSession)
+            XCTAssertFalse(terminals.all[0].stopped)
+        }
+    }
+
+    func testSwitchingContextDoesNotMarkK9sOutOfDate() async throws {
+        try await withK9s(immediate: true) { model, url, _ in
+            await self.open(model, "other")
+            model.makeActive("other")
+            XCTAssertTrue(try String(contentsOf: url, encoding: .utf8).contains("current-context: other"))
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .unchanged)
+        }
+    }
+
+    func testBaselineIsTheFileAsK9sReadIt() async throws {
+        try await withK9s { model, url, _ in
+            try Data(Self.fixture.replacingOccurrences(of: "https://dev.invalid", with: "https://new.invalid").utf8).write(to: url)
+            await self.open(model, "dev")
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSession?.freshness, .unchanged)
+        }
+    }
+
+    func testHeaderShowsTheClusterK9sConnectedTo() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            model.selectEntry("other")
+            model.selectEntry("dev")
+            XCTAssertEqual(model.k9sSession?.clusterName, "dev")
+        }
+    }
+
+    func testReplacingCollapsesAndRestartKeepsExpand() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            model.k9sIsExpanded = true
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertTrue(model.k9sIsExpanded)
+            await self.open(model, "other")
+            XCTAssertFalse(model.k9sIsExpanded)
+        }
+    }
+
+    func testDisplayedVisibilityWritesOnlyWhenNotExpanded() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            model.displayedColumnVisibility.wrappedValue = .detailOnly
+            XCTAssertEqual(model.columnVisibility, .detailOnly)
+            model.columnVisibility = .all
+            model.k9sIsExpanded = true
+            model.displayedColumnVisibility.wrappedValue = .automatic
+            XCTAssertEqual(model.columnVisibility, .all)
+        }
+    }
+
+    func testRedoStaysOffWhileK9sIsOnScreen() async throws {
+        try await withK9s { model, _, _ in
+            model.selectEntry("other")
+            model.editor?.fields["namespace"] = "edited"
+            model.commitForm()
+            model.undo()
+            XCTAssertTrue(model.canRedoCommand)
+            await self.open(model, "dev")
+            XCTAssertFalse(model.canRedoCommand)
+        }
+    }
+
+    func testYAMLModeHidesK9sAndKeepsIt() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            model.toggleRawEditor()
+            XCTAssertFalse(model.k9sIsVisible)
+            XCTAssertFalse(terminals.all[0].stopped)
+            XCTAssertNotNil(model.k9sBlockReason("dev"))
+        }
+    }
+
+    func testOnlyAskingForK9sTakesFocus() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            XCTAssertTrue(model.takeK9sFocusRequest())
+            XCTAssertFalse(model.takeK9sFocusRequest())
+            model.selectEntry("other")
+            model.selectEntry("dev")
+            XCTAssertFalse(model.takeK9sFocusRequest(), "Selecting the context in the list leaves focus there")
+            model.selectEntry("other")
+            await self.open(model, "dev")
+            XCTAssertTrue(model.takeK9sFocusRequest())
+        }
+    }
+}
+
+/// Holds a launch at its `PATH` lookup, so a test can act while it waits.
+@MainActor private final class LaunchGate {
+    private var isOpen = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiting.append($0) }
+    }
+    func open() {
+        isOpen = true
+        waiting.forEach { $0.resume() }
+        waiting = []
+    }
+}
+
+@MainActor private final class FakeK9sTerminal: K9sTerminal {
+    let view = NSView()
+    var onExit: ((Int32?) -> Void)?
+    var launch: K9sLaunch?
+    var stopped = false
+    func start(_ launch: K9sLaunch) { self.launch = launch }
+    func stop() { stopped = true }
+}
+
+@MainActor private final class FakeK9sTerminals {
+    var all: [FakeK9sTerminal] = []
+    func make() -> K9sTerminal {
+        let terminal = FakeK9sTerminal()
+        all.append(terminal)
+        return terminal
+    }
+}
+
 private struct UnwritableBackups: FileAccess {
     func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }
     func writeAtomically(_ data: Data, to url: URL) throws { throw CocoaError(.fileWriteNoPermission) }

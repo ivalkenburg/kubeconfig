@@ -48,7 +48,17 @@ Renaming a cluster/user updates its context references. Referenced entries canno
 
 The YAML button switches between the forms and the full file. The editor has syntax highlighting (up to 2 MB), line numbers, a marker on the line with a parse error, a find bar (⌘F, with ⌘G and ⇧⌘G to step through matches), and a **Wrap Lines** toggle in the toolbar and View menu. The same setting applies to backup previews, which have their own wrap button. Typing in the editor has its own undo, and the whole session becomes one step in the main history when you leave it. Unedited values, extension data, and unknown fields survive form edits. Comments and formatting may change. YAML merge keys (`<<`) must be expanded before editing. Tags such as `!!binary` or `!custom` can't be saved, so remove them in the editor before Apply or export; an immediate context switch leaves them alone. A leading byte order mark is accepted and dropped on Apply. Supported configuration size is 16 MB, with at most 64 nesting levels and a million values once aliases are expanded.
 
-Credentials are always visible in forms, the YAML editor, diffs, and previews. This app never executes credential plugins, connects to clusters, or logs configuration contents.
+Credentials are always visible in forms, the YAML editor, diffs, and previews. The app itself never executes credential plugins, connects to clusters, or logs configuration contents. The optional k9s terminal below is a separate program that does connect and does run credential plugins.
+
+## k9s
+
+**Open in k9s** (⇧⌘K, the terminal button on a context, its right-click menu, or the View menu) runs [k9s](https://k9scli.io) on that context in the detail pane. k9s isn't bundled: install it with `brew install k9s`. The app finds it through your login shell's `PATH`, then the usual Homebrew, MacPorts, and Nix folders, and credential plugins are found the same way. Opening k9s doesn't change the active context, and your k9s settings apply, including read-only mode. k9s can change what's on the cluster, so check the context name above the terminal, which shows where the session was opened from even if you switch contexts inside k9s.
+
+k9s reads the file on disk, so the action is unavailable while a pending change touches the context or the cluster or user it points to. Apply first. Changes to other entries don't matter.
+
+One session runs at a time. It keeps running while you look at other entries, shown by a terminal symbol on its context, and comes back when you select that context again. Close (the × button) ends it, as does opening k9s on another context, opening another file, quitting, or applying or reloading a file without that context. Ending a session also stops any port-forwards in it. Quitting k9s returns to the form. If k9s fails, its output stays on screen with Restart and Back. Expand gives k9s the whole window, and Undo, Redo, and Find are off while k9s is on screen.
+
+If the context, its cluster, or its user changes on disk during a session, a notice offers Restart, which needs any pending changes to them applied first. If the context is gone or renamed, it offers Close.
 
 ## Backups and rollback
 
@@ -111,4 +121,4 @@ open -n -W "build/debug/KubeConfig Dev.app" --args \
 - `Assets/AppIcon.png`: generated source icon.
 - `Makefile` and `Resources/Info.plist`: native app packaging and installation.
 
-YAML parsing uses [Yams](https://github.com/jpsim/Yams), pinned in `Package.swift` and `Package.resolved`. Its bundled libyaml and Yams are MIT licensed; notices are included in `Resources/ThirdPartyNotices.txt`.
+YAML parsing uses [Yams](https://github.com/jpsim/Yams) and the k9s terminal uses [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm), both pinned in `Package.swift` and `Package.resolved`. They and Yams's bundled libyaml are MIT licensed; notices are included in `Resources/ThirdPartyNotices.txt`.

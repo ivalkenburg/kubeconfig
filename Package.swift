@@ -8,10 +8,13 @@ let package = Package(
         .library(name: "KubeConfigCore", targets: ["KubeConfigCore"]),
         .executable(name: "KubeConfig", targets: ["KubeConfig"])
     ],
-    dependencies: [.package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2")],
+    dependencies: [
+        .package(url: "https://github.com/jpsim/Yams.git", exact: "6.2.2"),
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.99.2")
+    ],
     targets: [
         .target(name: "KubeConfigCore", dependencies: ["Yams"]),
-        .executableTarget(name: "KubeConfig", dependencies: ["KubeConfigCore"]),
+        .executableTarget(name: "KubeConfig", dependencies: ["KubeConfigCore", "SwiftTerm"]),
         .testTarget(name: "KubeConfigCoreTests", dependencies: ["KubeConfigCore", "Yams"]),
         .testTarget(name: "KubeConfigAppTests", dependencies: ["KubeConfig", "KubeConfigCore"])
     ],
