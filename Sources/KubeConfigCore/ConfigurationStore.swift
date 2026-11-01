@@ -17,6 +17,9 @@ public extension FileAccess {
 
 public struct LocalFileAccess: FileAccess {
     public init() {}
+
+    private var lastError: POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+
     public func read(_ url: URL) throws -> Data? {
         do { return try Data(contentsOf: url) }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
@@ -27,13 +30,13 @@ public struct LocalFileAccess: FileAccess {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else {
             if errno == ENOENT { return nil }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            throw lastError
         }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         defer { try? handle.close() }
         var information = stat()
         guard Darwin.fstat(descriptor, &information) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            throw lastError
         }
         guard information.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EFTYPE) }
         guard information.st_size <= maximumByteCount else { throw POSIXError(.EFBIG) }
@@ -63,7 +66,7 @@ public struct LocalFileAccess: FileAccess {
         }
         let temporary = directory.appendingPathComponent(".kubeconfig-\(UUID().uuidString).tmp")
         let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard descriptor >= 0 else { throw lastError }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
         defer {
             try? handle.close()
@@ -73,7 +76,7 @@ public struct LocalFileAccess: FileAccess {
         try handle.synchronize()
         if let expected, try read(url) != expected { throw ConfigError.externalChange }
         // rename(2) replaces the destination atomically, leaving no partial kubeconfig.
-        guard Darwin.rename(temporary.path, url.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard Darwin.rename(temporary.path, url.path) == 0 else { throw lastError }
         let parent = Darwin.open(directory.path, O_RDONLY)
         if parent >= 0 { _ = Darwin.fsync(parent); Darwin.close(parent) }
     }
@@ -167,13 +170,17 @@ public struct BackupStore {
 
     /// Reads a listed backup in full. A summary says nothing about its file, so this is where damage shows up.
     public func record(_ summary: BackupSummary, for configuration: URL) throws -> BackupRecord {
-        try verifiedRecord(at: location(for: configuration).appendingPathComponent(summary.id + ".json"), for: configuration)
+        try verifiedRecord(at: fileURL(of: summary.id, for: configuration), for: configuration)
     }
 
     public func remove(_ summary: BackupSummary, for configuration: URL) throws {
-        let url = location(for: configuration).appendingPathComponent(summary.id + ".json")
+        let url = fileURL(of: summary.id, for: configuration)
         try FileManager.default.removeItem(at: url)
         try? FileManager.default.removeItem(at: summaryURL(of: url))
+    }
+
+    private func fileURL(of id: String, for configuration: URL) -> URL {
+        location(for: configuration).appendingPathComponent(id + ".json")
     }
 
     private func summaryURL(of url: URL) -> URL { url.deletingPathExtension().appendingPathExtension("meta") }
@@ -219,7 +226,7 @@ public struct BackupStore {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folder.path)
-            let url = folder.appendingPathComponent(record.id + ".json")
+            let url = fileURL(of: record.id, for: configuration)
             try files.writeAtomically(JSONEncoder().encode(record), to: url)
             try? files.writeAtomically(JSONEncoder().encode(record.summary), to: summaryURL(of: url))
             saved = record

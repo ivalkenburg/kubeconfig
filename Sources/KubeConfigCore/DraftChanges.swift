@@ -14,7 +14,7 @@ public struct DraftChanges {
 
     init(draft: KubeDocument, disk: KubeDocument?) {
         for kind in EntryKind.allCases {
-            let old = Dictionary((disk?.entries(kind) ?? []).map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+            let old = disk?.entriesByName(kind) ?? [:]
             let new = draft.entries(kind)
             changed[kind] = Set(new.filter { entry in old[entry.name]?.node.isEquivalent(to: entry.node) != true }.map(\.name))
             let gone = Set(old.keys).subtracting(new.map(\.name))
@@ -50,9 +50,9 @@ extension KubeDocument {
     public func adoptingKeyOrder(of disk: KubeDocument) -> KubeDocument {
         var result = self
         for kind in EntryKind.allCases where !entries(kind).isEmpty {
-            let old = Dictionary(disk.entries(kind).map { ($0.name, $0.node) }, uniquingKeysWith: { first, _ in first })
+            let old = disk.entriesByName(kind)
             result.root[kind.rawValue] = Node(entries(kind).map { entry in
-                old[entry.name].flatMap { $0.isEquivalent(to: entry.node) ? $0 : nil } ?? entry.node
+                old[entry.name].flatMap { $0.node.isEquivalent(to: entry.node) ? $0.node : nil } ?? entry.node
             })
         }
         return result

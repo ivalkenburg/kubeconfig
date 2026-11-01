@@ -100,6 +100,36 @@ final class ContextExportTests: FileTestCase {
         XCTAssertTrue(plan.sourceFiles.isEmpty)
     }
 
+    func testYAMLNullsCountAsAbsentRatherThanAsPathsOrEmbeddedData() throws {
+        let original = try KubeDocument(yaml: """
+        clusters: [{name: c, cluster: {server: 'https://c.invalid', certificate-authority: null}}]
+        users: [{name: u, user: {client-certificate: cert, client-certificate-data: null, client-key: ~, tokenFile: null}}]
+        contexts: [{name: a, context: {cluster: c, user: u}}]
+        """)
+        var read: [String] = []
+        let plan = try ContextExportPlan(document: original, contextNames: ["a"], sourceDirectory: directory) {
+            read.append($0.lastPathComponent)
+            return Data("contents".utf8)
+        }
+        XCTAssertEqual(read, ["cert"], "A null is no path, and doesn't shadow one")
+        let user = try XCTUnwrap(KubeDocument(yaml: plan.yaml).entry(.users, named: "u"))
+        XCTAssertEqual(user.value("client-certificate-data"), Data("contents".utf8).base64EncodedString())
+        XCTAssertNil(user.fields["client-certificate"])
+    }
+
+    func testTildeIsNotExpandedSoItsPathStaysRelativeToTheConfiguration() throws {
+        let original = try KubeDocument(yaml: """
+        clusters: [{name: c, cluster: {server: 'https://c.invalid', certificate-authority: ~/ca}}]
+        contexts: [{name: a, context: {cluster: c}}]
+        """)
+        var read: [URL] = []
+        _ = try ContextExportPlan(document: original, contextNames: ["a"], sourceDirectory: directory) {
+            read.append($0)
+            return Data("ca".utf8)
+        }
+        XCTAssertEqual(read, [directory.appendingPathComponent("~/ca").standardizedFileURL.resolvingSymlinksInPath()])
+    }
+
     func testMissingUnreadableEmptyAndOversizedFilesBlockExportWithoutLeakingContents() throws {
         let original = try Fixtures.document()
         let failures: [(URL) throws -> Data?] = [

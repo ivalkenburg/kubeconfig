@@ -40,12 +40,12 @@ public struct ImportPlan {
                 var comparable = entry.node
                 if kind == .contexts { Self.rewriteContext(&comparable, maps: nameMaps) }
                 let identical = existing?.node.isEquivalent(to: comparable) ?? false
-                let needsRename = existing != nil && !identical
-                let destination = needsRename ? KubeDocument.uniqueName(entry.name + "-imported", isTaken: reserved.contains) : entry.name
-                reserved.insert(destination)
-                nameMaps[kind, default: [:]][entry.name] = destination
+                // Proposed for identical entries too, in case Rename is chosen over reusing them.
+                let proposed = existing == nil ? entry.name : KubeDocument.uniqueName(entry.name + "-imported", isTaken: reserved.contains)
+                reserved.insert(proposed)
+                nameMaps[kind, default: [:]][entry.name] = identical ? entry.name : proposed
                 items.append(ImportItem(kind: kind, originalName: entry.name, conflicts: existing != nil,
-                                        identical: identical, action: identical ? .reuse : .rename, destinationName: destination))
+                                        identical: identical, action: identical ? .reuse : .rename, destinationName: proposed))
             }
         }
     }
@@ -61,8 +61,7 @@ public struct ImportPlan {
         for kind in EntryKind.importOrder {
             var list = result.entries(kind).map(\.node)
             var destinations = Set<String>()
-            for item in items where item.kind == kind {
-                guard item.action != .skip else { continue }
+            for item in items where item.kind == kind && item.action != .skip {
                 let destination = maps[kind]![item.originalName]!
                 guard destinations.insert(destination).inserted else { throw ConfigError.invalid("Two imported \(kind.rawValue) resolve to ‘\(destination)’. Choose unique destination names.") }
                 var node = incoming.entry(kind, named: item.originalName)!.node

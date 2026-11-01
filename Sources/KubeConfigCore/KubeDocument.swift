@@ -56,9 +56,9 @@ public struct ConfigEntry: Identifiable, Equatable {
     public var id: String { name }
     public var fields: Node { node[kind.singular] ?? .emptyMapping }
     public func value(_ key: String) -> String { fields[key]?.text ?? "" }
+    /// Whether the field holds anything but a YAML null, which counts as leaving it out.
+    public func has(_ key: String) -> Bool { fields[key].map { $0.tag != Tag(.null) } ?? false }
     public var authenticationSummary: String {
-        let fields = fields
-        func has(_ key: String) -> Bool { fields[key].map { $0.tag != Tag(.null) } ?? false }
         if has("exec") { return "Credential plugin" }
         if has("auth-provider") { return "Authentication provider" }
         if has("token") || has("tokenFile") { return "Token" }
@@ -123,6 +123,10 @@ public struct KubeDocument: Equatable {
         entries(kind).first { $0.name == name }
     }
 
+    public func entriesByName(_ kind: EntryKind) -> [String: ConfigEntry] {
+        Dictionary(entries(kind).map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
     public func serialized() throws -> String {
         let text = try Yams.serialize(node: root, width: -1, allowUnicode: true)
         try Self.checkSize(text)
@@ -136,7 +140,8 @@ public struct KubeDocument: Equatable {
         if let current = root["current-context"], current.tag != Tag(.str) && current.null == nil {
             issues.append("current-context must be a string.")
         }
-        for cluster in entries(.clusters) {
+        let clusters = entries(.clusters), users = entries(.users), contexts = entries(.contexts)
+        for cluster in clusters {
             if !Self.isServerAddress(cluster.value("server")) {
                 issues.append("Cluster ‘\(cluster.name)’ needs a valid http or https server address.")
             }
@@ -147,8 +152,8 @@ public struct KubeDocument: Equatable {
                 }
             }
         }
-        for user in entries(.users) {
-            issues += Self.stringFieldIssues(user, keys: ["username", "password", "token", "tokenFile", "client-certificate", "client-certificate-data", "client-key", "client-key-data", "as", "as-uid"])
+        for user in users {
+            issues += Self.stringFieldIssues(user, keys:["username", "password", "token", "tokenFile", "client-certificate", "client-certificate-data", "client-key", "client-key-data", "as", "as-uid"])
             for key in ["exec", "auth-provider"] {
                 if let value = user.fields[key], value.null == nil && value.mapping == nil {
                     issues.append("\(key) in user ‘\(user.name)’ must be a mapping.")
@@ -169,18 +174,14 @@ public struct KubeDocument: Equatable {
             }
         }
         // Scanning the lists for each name took 19 ms at 100 entries.
-        let clusters = Set(entries(.clusters).map(\.name)), users = Set(entries(.users).map(\.name))
-        for context in entries(.contexts) {
+        let clusterNames = Set(clusters.map(\.name)), userNames = Set(users.map(\.name))
+        for context in contexts {
             let user = context.value("user")
-            if !clusters.contains(context.value("cluster")) { issues.append("Context ‘\(context.name)’ refers to a missing cluster.") }
-            if !user.isEmpty && !users.contains(user) { issues.append("Context ‘\(context.name)’ refers to a missing user.") }
-            for key in ["cluster", "user", "namespace"] {
-                if let value = context.fields[key], value.tag != Tag(.str) && value.null == nil {
-                    issues.append("\(key.capitalized) in context ‘\(context.name)’ must be a string.")
-                }
-            }
+            if !clusterNames.contains(context.value("cluster")) { issues.append("Context ‘\(context.name)’ refers to a missing cluster.") }
+            if !user.isEmpty && !userNames.contains(user) { issues.append("Context ‘\(context.name)’ refers to a missing user.") }
+            issues += Self.stringFieldIssues(context, keys: ["cluster", "user", "namespace"])
         }
-        if !currentContext.isEmpty && entry(.contexts, named: currentContext) == nil {
+        if !currentContext.isEmpty && !contexts.contains(where: { $0.name == currentContext }) {
             issues.append("The active context ‘\(currentContext)’ does not exist.")
         }
         return issues
@@ -283,22 +284,20 @@ public struct KubeDocument: Equatable {
 
     public mutating func resolveRelativePaths(relativeTo directory: URL) -> [String] {
         var resolutions: [String] = []
-        for kind in EntryKind.referenced {
+        func resolved(_ path: String) -> Node {
+            let absolute = directory.appendingPathComponent(path).standardizedFileURL.path
+            resolutions.append("\(path) → \(absolute)")
+            return Self.string(absolute)
+        }
+        for kind in EntryKind.referenced where !entries(kind).isEmpty {
             var nodes = entries(kind).map(\.node)
             for index in nodes.indices {
                 var fields = nodes[index][kind.singular]!
                 for key in Self.fileKeys(kind) {
-                    if let value = fields[key]?.text, !value.isEmpty, !NSString(string: value).isAbsolutePath {
-                        let resolved = directory.appendingPathComponent(value).standardizedFileURL.path
-                        fields[key] = Self.string(resolved)
-                        resolutions.append("\(value) → \(resolved)")
-                    }
+                    if let value = fields[key]?.text, !value.isEmpty, !value.isAbsolutePath { fields[key] = resolved(value) }
                 }
-                if kind == .users, let command = fields["exec"]?["command"]?.text,
-                   command.contains("/"), !NSString(string: command).isAbsolutePath {
-                    let resolved = directory.appendingPathComponent(command).standardizedFileURL.path
-                    fields["exec"]?["command"] = Self.string(resolved)
-                    resolutions.append("\(command) → \(resolved)")
+                if kind == .users, let command = fields["exec"]?["command"]?.text, command.contains("/"), !command.isAbsolutePath {
+                    fields["exec"]?["command"] = resolved(command)
                 }
                 nodes[index][kind.singular] = fields
             }
@@ -368,6 +367,11 @@ public struct KubeDocument: Equatable {
             for value in sequence { try checkMappings(value, depth: depth + 1, nodeCount: &nodeCount) }
         }
     }
+}
+
+extension String {
+    /// Whether client-go takes this path as it stands. NSString's check of the same name also accepts `~`, which client-go doesn't expand.
+    var isAbsolutePath: Bool { hasPrefix("/") }
 }
 
 extension Node {

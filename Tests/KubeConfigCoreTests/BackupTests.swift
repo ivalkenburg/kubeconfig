@@ -125,6 +125,7 @@ final class BackupTests: FileTestCase {
         try writeInitial()
         XCTAssertThrowsError(try store.apply(Fixtures.changed(), over: store.load(config), retention: -1))
         XCTAssertEqual(try diskText(), Fixtures.yaml)
+        XCTAssertThrowsError(try backups.savePrevious(Data("old".utf8), for: config, retention: -1))
     }
 }
 

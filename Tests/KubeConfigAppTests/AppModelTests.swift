@@ -121,6 +121,30 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testRedoAfterImmediateSwitchKeepsTheNewContext() async throws {
+        try await withModel(immediate: true) { model, _ in
+            model.editor?.fields["namespace"] = "payments"
+            try model.flushEditor()
+            model.undo()
+            model.makeActive("other")
+            model.redo()
+            XCTAssertEqual(model.document?.currentContext, "other")
+            XCTAssertEqual(model.document?.entry(.contexts, named: "dev")?.value("namespace"), "payments")
+            XCTAssertEqual(model.pendingChanges?.activeContextChanged, false)
+        }
+    }
+
+    func testImmediateSwitchLeavesABrokenDraftInTheHistoryAlone() async throws {
+        try await withModel(immediate: true) { model, _ in
+            model.editRaw("broken: [")
+            model.undo()
+            model.makeActive("other")
+            model.redo()
+            XCTAssertEqual(model.draftText, "broken: [")
+            XCTAssertNotNil(model.parseIssue)
+        }
+    }
+
     func testImmediateClearEmptiesTheActiveContextInTheFile() async throws {
         try await withModel(immediate: true) { model, url in
             model.clearActive()
@@ -817,6 +841,18 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testACommittedEditOfAnyKindDropsASearchThatWouldHideItsRow() async throws {
+        try await withModel { model, _ in
+            model.selectSection(.clusters)
+            model.search = "dev"
+            model.editor?.name = "staging"
+            model.editor?.fields["server"] = "https://staging.invalid"
+            try model.flushEditor()
+            XCTAssertEqual(model.search, "")
+            XCTAssertEqual(model.visibleEntries.map(\.name), ["staging"])
+        }
+    }
+
     func testReturningFromYAMLKeepsTheSelectedEntry() async throws {
         try await withModel { model, _ in
             model.selectEntry("other")
@@ -1304,6 +1340,46 @@ final class AppModelTests: XCTestCase {
             XCTAssertNil(model.recoveryContents)
             XCTAssertNil(model.backupWarning)
             XCTAssertEqual(try String(contentsOf: export, encoding: .utf8), Self.fixture)
+        }
+    }
+
+    func testLeavingAfterAFailedBackupCanBeCancelled() async throws {
+        try await withModel(backupFiles: UnwritableBackups()) { model, _ in
+            model.editor?.fields["namespace"] = "changed"
+            model.requestReview()
+            model.commit()
+            model.ask = { _, _, _ in 2 }
+            var continued = false
+            model.resolvePendingChanges { continued = true }
+            XCTAssertFalse(continued)
+            XCTAssertNotNil(model.recoveryContents)
+            XCTAssertNotNil(model.backupWarning)
+        }
+    }
+
+    func testPreviousContentsCannotBeExportedOverTheOpenFile() async throws {
+        try await withModel(backupFiles: UnwritableBackups()) { model, url in
+            model.editor?.fields["namespace"] = "changed"
+            model.requestReview()
+            model.commit()
+            model.chooseExportURL = { _, _ in url }
+            model.exportRecovery()
+            XCTAssertNotNil(model.errorMessage)
+            XCTAssertNotNil(model.recoveryContents)
+        }
+    }
+
+    func testQuittingWithPendingChangesAsksFirst() async throws {
+        try await withModel { model, _ in
+            let delegate = ApplicationDelegate()
+            delegate.model = model
+            XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateNow)
+            model.editor?.fields["namespace"] = "changed"
+            var asked = false
+            model.ask = { _, _, _ in asked = true; return 2 }
+            XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateCancel)
+            XCTAssertTrue(asked)
+            XCTAssertTrue(model.hasPendingChanges)
         }
     }
 
@@ -2036,10 +2112,204 @@ extension AppModelTests {
             try Data([0xff, 0xfe, 0x00]).write(to: binary)
             for file in [binary, folder.appendingPathComponent("absent")] {
                 XCTAssertThrowsError(try model.prepareImport(file: file)) {
-                    XCTAssertEqual($0 as? ConfigError, .invalid("Choose a UTF-8 kubeconfig file."))
+                    XCTAssertEqual($0 as? ConfigError, .invalid("Choose a UTF-8 kubeconfig file of at most 16 MB."))
                 }
             }
             XCTAssertFalse(model.showImport)
+        }
+    }
+
+    func testImportRefusesWhatItShouldNotReadInFull() async throws {
+        try await withModel { model, url in
+            let folder = url.deletingLastPathComponent()
+            let pipe = folder.appendingPathComponent("pipe")
+            XCTAssertEqual(mkfifo(pipe.path, 0o600), 0)
+            let oversized = folder.appendingPathComponent("oversized")
+            FileManager.default.createFile(atPath: oversized.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: oversized)
+            try handle.truncate(atOffset: UInt64(KubeDocument.maximumByteCount) + 1)
+            try handle.close()
+            for file in [pipe, oversized, folder] {
+                XCTAssertThrowsError(try model.prepareImport(file: file), file.lastPathComponent)
+            }
+            XCTAssertFalse(model.showImport)
+        }
+    }
+
+    func testOpeningAFileWaitsForPendingChangesAndAPick() async throws {
+        try await withModel { model, url in
+            let other = url.deletingLastPathComponent().appendingPathComponent("other")
+            try Data(Self.fixture.replacingOccurrences(of: "name: other", with: "name: elsewhere").utf8).write(to: other)
+            var titles: [String] = []
+            model.chooseFile = { titles.append($0); return nil }
+            model.openConfiguration()
+            XCTAssertEqual(titles, ["Open Configuration"])
+            XCTAssertEqual(model.snapshot?.url, url.standardizedFileURL, "Cancelling keeps the open file")
+
+            model.editor?.fields["namespace"] = "pending"
+            model.ask = { _, _, _ in 2 }
+            model.openConfiguration()
+            XCTAssertEqual(titles.count, 1, "Cancelling the question never reaches the picker")
+
+            model.ask = { _, _, _ in 1 }
+            model.chooseFile = { _ in other }
+            model.openConfiguration()
+            XCTAssertEqual(model.snapshot?.url, other.standardizedFileURL)
+            XCTAssertNotNil(model.document?.entry(.contexts, named: "elsewhere"))
+        }
+    }
+
+    func testChoosingAnImportFileOpensItsReview() async throws {
+        try await withModel { model, url in
+            model.chooseFile = { _ in nil }
+            try model.chooseImportFile()
+            XCTAssertFalse(model.showImport)
+            model.chooseFile = { _ in url }
+            try model.chooseImportFile()
+            XCTAssertTrue(model.showImport)
+            XCTAssertNotNil(model.importPlan)
+        }
+    }
+
+    func testBackupPreviewShowsContentsEvenWhenTheyAreNotUTF8() async throws {
+        try await withModel { model, _ in
+            let snapshot = try XCTUnwrap(model.snapshot)
+            let text = try XCTUnwrap(model.store.backups.savePrevious(Data("key: value\n".utf8), for: snapshot.resolvedURL, retention: 10))
+            let binary = try XCTUnwrap(model.store.backups.savePrevious(Data([0x61, 0xff]), for: snapshot.resolvedURL, retention: 10))
+            XCTAssertEqual(try model.backupPreview(text.summary), "key: value\n")
+            XCTAssertEqual(try model.backupPreview(binary.summary), "a\u{FFFD}")
+        }
+    }
+
+    func testAnUnreadableFileCountsAsChangedOutside() async throws {
+        try await withModel { model, url in
+            try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: url.path)
+            model.checkForExternalChange()
+            XCTAssertTrue(model.fileChangedOnDisk)
+        }
+    }
+
+    func testActionsReportAFormThatCannotBeCommitted() async throws {
+        try await withModel { model, _ in
+            let actions: [(String, () -> Void)] = [
+                ("selectEntry", { model.selectEntry("other") }),
+                ("selectSection", { model.selectSection(.clusters) }),
+                ("addEntry", model.addEntry),
+                ("duplicateEntry", { model.duplicateEntry("dev") }),
+                ("makeActive", { model.makeActive() }),
+                ("clearActive", model.clearActive),
+                ("deleteEntry", { model.deleteEntry() }),
+                ("toggleRawEditor", model.toggleRawEditor),
+                ("exportDraft", model.exportDraft)
+            ]
+            for (name, action) in actions {
+                model.editor?.name = ""
+                action()
+                XCTAssertNotNil(model.errorMessage, name)
+                XCTAssertEqual(model.editor?.name, "", name)
+                XCTAssertEqual(model.document?.entries(.contexts).count, 2, name)
+                model.errorMessage = nil
+            }
+        }
+    }
+
+    func testAFormEditThatCannotCommitLeavesTheCountsOnTheDraft() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["namespace"] = "changed"
+            model.editor?.name = ""
+            XCTAssertEqual(model.pendingChanges?.count, 0)
+            XCTAssertEqual(model.validationIssues, [])
+        }
+    }
+
+    func testFormEditsAreCountedBeforeThereIsAFile() async throws {
+        try await withModel(initial: nil) { model, _ in
+            model.createConfiguration()
+            model.addEntry()
+            let before = model.pendingChanges?.count(.contexts)
+            model.editor?.name = "named"
+            XCTAssertEqual(model.pendingChanges?.count(.contexts), before)
+            XCTAssertTrue(model.pendingChanges?.contains(.contexts, name: "named") == true)
+        }
+    }
+
+    func testANewContextLeavesItsReferencesEmptyWhenThereIsNothingToPick() async throws {
+        try await withModel(initial: "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\n") { model, _ in
+            model.addEntry()
+            XCTAssertEqual(model.editor?.name, "new-context")
+            XCTAssertEqual(model.editor?.fields["cluster"], "")
+            XCTAssertEqual(model.validationIssues, ["Context ‘new-context’ refers to a missing cluster."])
+        }
+    }
+
+    func testABlankConfigurationHasNothingToReportOrExport() async throws {
+        try await withModel(initial: "\n") { model, _ in
+            XCTAssertTrue(model.hasNoConfiguration)
+            XCTAssertEqual(model.validationIssues, [])
+            XCTAssertNil(model.pendingChanges)
+            XCTAssertFalse(model.canApply)
+            XCTAssertEqual(model.contextExportTitle, "Export Selected Contexts")
+        }
+    }
+
+    func testUndoAndRedoWithNoHistoryChangeNothing() async throws {
+        try await withModel { model, _ in
+            model.undo()
+            model.redo()
+            XCTAssertEqual(model.draftText, Self.fixture)
+            XCTAssertFalse(model.canUndo)
+            XCTAssertFalse(model.canRedo)
+        }
+    }
+
+    func testRemovingAWholeMultipleSelectionInYAMLFallsBackToTheFirstEntry() async throws {
+        try await withModel { model, _ in
+            model.selectContexts(["dev", "other"])
+            model.toggleRawEditor()
+            model.editRaw(Self.fixture.replacingOccurrences(of: "name: dev\n  context", with: "name: kept\n  context")
+                .replacingOccurrences(of: "name: other", with: "name: another"))
+            model.toggleRawEditor()
+            XCTAssertEqual(model.selectedContextNames, ["another"])
+            XCTAssertEqual(model.editor?.originalName, "another")
+        }
+    }
+
+    func testSheetsRenderTheirContent() async throws {
+        try await withModel { model, url in
+            model.editor?.fields["namespace"] = "changed"
+            try model.flushEditor()
+            try model.prepareImport(file: url)
+            let plan = try XCTUnwrap(model.importPlan)
+            model.closeImport()
+            try model.store.backups.savePrevious(Data("key: value\n".utf8), for: XCTUnwrap(model.snapshot).resolvedURL, retention: 10)
+            model.refreshBackups()
+            model.selectContexts(["dev", "other"])
+            model.requestContextExport()
+            let export = try XCTUnwrap(model.contextExportPlan)
+
+            @MainActor func render(_ view: some View) async throws {
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 680), styleMask: [.titled], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                let host = NSHostingView(rootView: view)
+                window.contentView = host
+                window.orderFront(nil)
+                defer { window.orderOut(nil) }
+                try await Task.sleep(for: .milliseconds(50))
+                XCTAssertGreaterThan(host.fittingSize.height, 0)
+            }
+            try await render(ReviewSheet(model: model))
+            try await render(ImportSourceSheet(model: model))
+            try await render(ImportSheet(model: model, initialPlan: plan))
+            try await render(ContextExportSheet(model: model, plan: export))
+            try await render(ContextSelectionSummary(model: model))
+            try await render(PreferencesView())
+            model.closeContextExport()
+            model.selectSection(.backups)
+            try await render(BackupDetailView(model: model))
+            model.selectSection(.clusters)
+            try await render(EntryDetailView(model: model))
+            model.selectSection(.contexts)
+            try await render(EntryDetailView(model: model))
         }
     }
 

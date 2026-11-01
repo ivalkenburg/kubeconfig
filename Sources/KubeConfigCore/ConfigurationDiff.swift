@@ -10,7 +10,7 @@ public struct DiffLine: Identifiable, Equatable {
 public enum ConfigurationDiff {
     /// Compares serialized documents, so formatting alone doesn't bury the real changes.
     public static func lines(before: String, after: KubeDocument) throws -> [DiffLine] {
-        try lines(serializedBefore: (try? KubeDocument(yaml: before))?.serialized() ?? before, after: after)
+        try lines(serializedBefore: (try? KubeDocument(yaml: before).serialized()) ?? before, after: after)
     }
 
     /// For comparing many drafts with one file, whose serialized text can be kept rather than parsed each time.

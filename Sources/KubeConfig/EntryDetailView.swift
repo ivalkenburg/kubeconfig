@@ -43,7 +43,7 @@ struct EntryDetailView: View {
                     }
                     Section {
                         pathField("Certificate authority", key: "certificate-authority")
-                        if entry?.fields["certificate-authority-data"] != nil {
+                        if entry?.has("certificate-authority-data") == true {
                             Label("An embedded CA certificate takes precedence over the file path.", systemImage: "lock.doc")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -65,7 +65,7 @@ struct EntryDetailView: View {
                     Section("Certificate files") {
                         pathField("Client certificate", key: "client-certificate")
                         pathField("Private key", key: "client-key")
-                        if entry?.fields["client-key-data"] != nil {
+                        if entry?.has("client-key-data") == true {
                             Label("Embedded private key retained. Edit it in YAML.", systemImage: "lock.doc")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -123,8 +123,7 @@ struct EntryDetailView: View {
         HStack {
             textField(title, key: key, prompt: "Optional file path")
             Button {
-                let panel = NSOpenPanel(); panel.title = "Choose \(title.lowercased())"; panel.showsHiddenFiles = true
-                if panel.runModal() == .OK, let url = panel.url { model.editor?.fields[key] = url.path; model.commitForm() }
+                if let url = model.chooseFile("Choose \(title.lowercased())") { model.editor?.fields[key] = url.path; model.commitForm() }
             } label: { Image(systemName: "folder") }
             .buttonStyle(.borderless).help("Choose \(title.lowercased()) file")
             .accessibilityLabel("Choose \(title.lowercased()) file")

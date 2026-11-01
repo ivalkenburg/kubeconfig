@@ -80,6 +80,35 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertEqual(reloaded.entry(.users, named: "u")?.value("password"), "1234")
     }
 
+    func testAnExplicitStringTagLeavesTheOtherValuesTheirTypes() throws {
+        let doc = try KubeDocument(yaml: "a: !!str 123\nb: 123\nc: true\nd: ~\n")
+        let reloaded = try KubeDocument(yaml: doc.serialized())
+        XCTAssertEqual(reloaded.root["a"]?.tag, Tag(.str))
+        XCTAssertEqual(reloaded.root["b"]?.int, 123)
+        XCTAssertEqual(reloaded.root["c"]?.bool, true)
+        XCTAssertNil(reloaded.root["d"]?.text)
+    }
+
+    func testAnErrorWithoutALocationStillLeavesTheSourceOut() {
+        XCTAssertThrowsError(try KubeDocument(yaml: "token: secret\u{7}\n")) {
+            XCTAssertEqual($0 as? ConfigError, .invalid("Could not parse the YAML. Check its encoding and syntax."))
+        }
+    }
+
+    func testANullFieldIsNotSet() throws {
+        let entry = try XCTUnwrap(KubeDocument(yaml: "users: [{name: u, user: {token: null, client-key-data: abc}}]").entry(.users, named: "u"))
+        XCTAssertFalse(entry.has("token"))
+        XCTAssertFalse(entry.has("password"))
+        XCTAssertTrue(entry.has("client-key-data"))
+    }
+
+    func testEntriesByNameFindsEveryEntry() throws {
+        let doc = try KubeDocument(yaml: "clusters: [{name: a, cluster: {}}, {name: b, cluster: {}}]")
+        XCTAssertEqual(doc.entriesByName(.clusters).keys.sorted(), ["a", "b"])
+        XCTAssertEqual(doc.entriesByName(.clusters)["b"], doc.entry(.clusters, named: "b"))
+        XCTAssertEqual(doc.entriesByName(.users).count, 0)
+    }
+
     func testNamespaceEditRetainsReferencesAndUnknownContextFields() throws {
         var doc = try Fixtures.document()
         let old = doc.entry(.contexts, named: "development")!
@@ -172,7 +201,7 @@ final class KubeDocumentTests: XCTestCase {
 
     func testContextFieldsMustBeStrings() throws {
         let doc = try KubeDocument(yaml: "clusters: [{name: c, cluster: {server: 'https://c.invalid'}}]\ncontexts: [{name: x, context: {cluster: c, namespace: 5}}]\n")
-        XCTAssertEqual(doc.validationIssues, ["Namespace in context ‘x’ must be a string."])
+        XCTAssertEqual(doc.validationIssues, ["namespace in context ‘x’ must be a string."])
     }
 
     func testMappingKeysMustBeStrings() {
@@ -239,10 +268,31 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertFalse(try KubeDocument(yaml: "users: [{name: u, user: {tokenFile: /t, exec: {command: aws}}}]").hasRelativePaths)
     }
 
-    func testSizeNestingAndMergeKeyLimitsAreEnforced() {
-        XCTAssertThrowsError(try KubeDocument(yaml: "a: " + String(repeating: "x", count: KubeDocument.maximumByteCount)))
-        XCTAssertThrowsError(try KubeDocument(yaml: String(repeating: "[", count: 70) + String(repeating: "]", count: 70)))
+    func testResolvingPathsAddsNoListsTheFileLeftOut() throws {
+        var doc = try KubeDocument(yaml: "clusters:\n- name: c\n  cluster: {server: 'https://c.invalid', certificate-authority: ca}\n")
+        XCTAssertEqual(doc.resolveRelativePaths(relativeTo: URL(fileURLWithPath: "/base")), ["ca → /base/ca"])
+        XCTAssertNil(doc.root["users"])
+    }
+
+    func testSizeNestingAndMergeKeyLimitsAreEnforced() throws {
+        XCTAssertThrowsError(try KubeDocument(yaml: "a: " + String(repeating: "x", count: KubeDocument.maximumByteCount))) {
+            XCTAssertEqual($0 as? ConfigError, .invalid("Configuration exceeds the 16 MB size limit."))
+        }
+        func nested(_ levels: Int) -> String { "a: " + String(repeating: "[", count: levels) + String(repeating: "]", count: levels) }
+        XCTAssertNoThrow(try KubeDocument(yaml: nested(63)))
+        XCTAssertThrowsError(try KubeDocument(yaml: nested(64))) {
+            XCTAssertEqual($0 as? ConfigError, .invalid("YAML nesting exceeds 64 levels."))
+        }
         XCTAssertThrowsError(try KubeDocument(yaml: "base: &base {a: 1}\nother:\n  <<: *base\n"))
+    }
+
+    func testTheBundledExampleIsValid() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let example = try KubeDocument(yaml: String(contentsOf: root.appendingPathComponent("Examples/sample-config.yaml"), encoding: .utf8))
+        XCTAssertEqual(example.validationIssues, [])
+        // The debug UI capture selects these two by name.
+        XCTAssertNotNil(example.entry(.contexts, named: "development"))
+        XCTAssertNotNil(example.entry(.contexts, named: "production-eu"))
     }
 
     func testDuplicateNamesAndKeysAreRejected() {
@@ -300,6 +350,13 @@ final class KubeDocumentTests: XCTestCase {
     func testDiffAgainstAnInvalidOriginalShowsItsText() throws {
         let lines = try ConfigurationDiff.lines(before: "contexts: [broken", after: Fixtures.document())
         XCTAssertTrue(lines.contains { $0.change == .removed && $0.text == "contexts: [broken" })
+    }
+
+    func testDiffAgainstAFileThatSerializesPastTheLimitShowsItsText() throws {
+        // An alias writes its value out again, so this parses but can't be serialized.
+        let value = String(repeating: "x", count: KubeDocument.maximumByteCount / 2 + 1)
+        let lines = try ConfigurationDiff.lines(before: "a: &a \(value)\nb: *a\n", after: Fixtures.document())
+        XCTAssertTrue(lines.contains { $0.change == .removed && $0.text == "b: *a" })
     }
 
     func testDiffAgainstAMissingFileAddsEveryLine() throws {

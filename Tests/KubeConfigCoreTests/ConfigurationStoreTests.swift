@@ -264,6 +264,40 @@ final class ConfigurationStoreTests: FileTestCase {
         XCTAssertThrowsError(try LocalFileAccess().replaceIfUnchanged(Data("new".utf8), at: config, expectedContents: nil))
         XCTAssertEqual(try diskText(), Fixtures.yaml)
     }
+
+    func testFolderThatRefusesTheTemporaryFileKeepsTheConfiguration() throws {
+        try writeInitial()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        XCTAssertThrowsError(try LocalFileAccess().writeAtomically(Data("new".utf8), to: config)) {
+            XCTAssertEqual(($0 as? POSIXError)?.code, .EACCES)
+        }
+        XCTAssertEqual(try diskText(), Fixtures.yaml)
+    }
+
+    func testFailedReplacementLeavesNoTemporaryFile() throws {
+        let folder = directory.appendingPathComponent("folder")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try LocalFileAccess().writeAtomically(Data("new".utf8), to: folder))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["folder"])
+    }
+
+    func testBoundedReadReportsAFileItCannotOpen() throws {
+        try writeInitial()
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: config.path)
+        XCTAssertThrowsError(try LocalFileAccess().read(config, maximumByteCount: 1024)) {
+            XCTAssertEqual(($0 as? POSIXError)?.code, .EACCES)
+        }
+    }
+
+    func testBoundedReadTakesAFileAtTheLimitAndRefusesOneOverIt() throws {
+        try Data("1234".utf8).write(to: config)
+        XCTAssertEqual(try LocalFileAccess().read(config, maximumByteCount: 4), Data("1234".utf8))
+        XCTAssertThrowsError(try LocalFileAccess().read(config, maximumByteCount: 3)) {
+            XCTAssertEqual(($0 as? POSIXError)?.code, .EFBIG)
+        }
+        XCTAssertNil(try LocalFileAccess().read(directory.appendingPathComponent("absent"), maximumByteCount: 4))
+    }
 }
 
 private struct MinimalFiles: FileAccess {

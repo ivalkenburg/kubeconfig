@@ -96,6 +96,21 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(merged.entry(.users, named: "bare")!.fields["exec"]?["command"]?.string, "aws")
     }
 
+    func testTildePathsResolveLikeAnyOtherRelativePath() throws {
+        let doc = try KubeDocument(yaml: "clusters: [{name: x, cluster: {server: 'https://x.invalid', certificate-authority: ~/ca}}]")
+        XCTAssertThrowsError(try ImportPlan(target: .empty, incoming: doc, sourceDirectory: nil))
+        let merged = try ImportPlan(target: .empty, incoming: doc, sourceDirectory: source).merged(into: .empty)
+        XCTAssertEqual(merged.entry(.clusters, named: "x")?.value("certificate-authority"), "/test/provider/~/ca")
+    }
+
+    func testRenamingAnIdenticalEntryStartsFromAFreeName() throws {
+        let doc = try KubeDocument(yaml: "clusters: [{name: dev, cluster: {server: 'https://dev.invalid'}}]")
+        var plan = try ImportPlan(target: doc, incoming: doc, sourceDirectory: nil)
+        XCTAssertEqual(plan.items[0].action, .reuse)
+        plan.items[0].action = .rename
+        XCTAssertNotNil(try plan.merged(into: doc).entry(.clusters, named: "dev-imported"))
+    }
+
     func testAPathSharedByEntriesIsListedOnce() throws {
         let incoming = try KubeDocument(yaml: "users: [{name: a, user: {client-key: key}}, {name: b, user: {client-key: key}}]\n")
         let plan = try ImportPlan(target: .empty, incoming: incoming, sourceDirectory: source)
@@ -120,6 +135,22 @@ final class ImportTests: XCTestCase {
         let filled = try KubeDocument(yaml: "preferences: {colors: true}\n")
         XCTAssertEqual(try ImportPlan(target: empty, incoming: filled, sourceDirectory: nil).merged(into: empty).root["preferences"]?["colors"]?.bool, true)
         XCTAssertEqual(try ImportPlan(target: filled, incoming: empty, sourceDirectory: nil).merged(into: filled).root["preferences"]?["colors"]?.bool, true)
+    }
+
+    func testMetadataMappingsCombineKeysFromBothFiles() throws {
+        let target = try KubeDocument(yaml: "preferences: {nested: {old: 1}}\n")
+        let incoming = try KubeDocument(yaml: "preferences: {nested: {new: 2}}\n")
+        let nested = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil).merged(into: target).root["preferences"]?["nested"]
+        XCTAssertEqual(nested?["old"]?.int, 1)
+        XCTAssertEqual(nested?["new"]?.int, 2)
+    }
+
+    func testReplaceAddsTheEntryWhenItIsNoLongerInTheDraft() throws {
+        let doc = try KubeDocument(yaml: "clusters: [{name: dev, cluster: {server: 'https://dev.invalid'}}]")
+        let changed = try KubeDocument(yaml: "clusters: [{name: dev, cluster: {server: 'https://new.invalid'}}]")
+        var plan = try ImportPlan(target: doc, incoming: changed, sourceDirectory: nil)
+        plan.items[0].action = .replace
+        XCTAssertEqual(try plan.merged(into: .empty).entry(.clusters, named: "dev")?.value("server"), "https://new.invalid")
     }
 
     func testMetadataListsMergeUnlessANamedItemDiffers() throws {

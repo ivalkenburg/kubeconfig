@@ -14,7 +14,7 @@ struct LaunchOptions {
             guard option == "--config" || option == "--capture-dir" else { index += 1; continue }
             guard arguments.indices.contains(index + 1), !arguments[index + 1].isEmpty,
                   !arguments[index + 1].hasPrefix("--") else {
-                throw ConfigError.invalid("\(option) requires a file path.")
+                throw ConfigError.invalid("\(option) requires a path.")
             }
             let url = URL(fileURLWithPath: arguments[index + 1]).standardizedFileURL
             if option == "--config" { configuration = url } else { capture = url }
