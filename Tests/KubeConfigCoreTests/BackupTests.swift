@@ -99,6 +99,33 @@ final class BackupTests: FileTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: damaged.path))
     }
 
+    func testOversizedSummaryIsRebuiltAndOversizedRecordIsReportedDamaged() throws {
+        let record = try XCTUnwrap(backups.savePrevious(Data("kept".utf8), for: config, retention: 10))
+        let folder = backups.location(for: config)
+        let summary = folder.appendingPathComponent(record.id + ".meta")
+        let handle = try FileHandle(forWritingTo: summary)
+        try handle.truncate(atOffset: 128 * 1024 * 1024)
+        try handle.close()
+        XCTAssertEqual(try backups.records(for: config).records, [record.summary])
+        XCTAssertLessThan(try Data(contentsOf: summary).count, 64 * 1024)
+        let json = folder.appendingPathComponent(record.id + ".json")
+        let jsonHandle = try FileHandle(forWritingTo: json)
+        try jsonHandle.truncate(atOffset: 128 * 1024 * 1024)
+        try jsonHandle.close()
+        XCTAssertThrowsError(try backups.record(record.summary, for: config)) {
+            XCTAssertTrue($0.localizedDescription.contains("damaged"))
+        }
+        try FileManager.default.removeItem(at: summary)
+        XCTAssertEqual(try backups.records(for: config), BackupListing(records: [], damagedCount: 1))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: json.path))
+    }
+
+    func testLargestBackupPayloadSurvivesBase64AndJSONEscaping() throws {
+        let contents = Data(repeating: 0xff, count: KubeDocument.maximumByteCount)
+        let record = try XCTUnwrap(backups.savePrevious(contents, for: config, retention: 10))
+        XCTAssertEqual(try backups.record(record.summary, for: config).contents, contents)
+    }
+
     func testListingNeverReadsBackupContents() throws {
         let files = RecordingFiles()
         let store = BackupStore(directory: directory.appendingPathComponent("recorded"), files: files)
@@ -151,6 +178,6 @@ final class BackupTests: FileTestCase {
 
 private final class RecordingFiles: FileAccess {
     var reads: [URL] = []
-    func read(_ url: URL) throws -> Data? { reads.append(url); return try LocalFileAccess().read(url) }
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data? { reads.append(url); return try LocalFileAccess().read(url, maximumByteCount: maximumByteCount) }
     func writeAtomically(_ data: Data, to url: URL) throws { try LocalFileAccess().writeAtomically(data, to: url) }
 }

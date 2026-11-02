@@ -18,13 +18,12 @@ public struct ImportPlan {
     public let incoming: KubeDocument
     public let resolvedPaths: [String]
     public var items: [ImportItem]
-    public var activateImportedContext = false
 
     public init(target: KubeDocument, incoming: KubeDocument, sourceDirectory: URL?) throws {
         if let version = incoming.root["apiVersion"], version.string != "v1" { throw ConfigError.invalid("Imported apiVersion must be v1.") }
         if let kind = incoming.root["kind"], kind.string != "Config" { throw ConfigError.invalid("The imported file must have kind Config.") }
         var resolved = incoming
-        if resolved.hasRelativePaths && sourceDirectory == nil {
+        if sourceDirectory == nil && resolved.hasRelativePaths {
             throw ConfigError.invalid("Choose the source folder to resolve the relative file paths in this import.")
         }
         // Entries can share a file, and the sheet identifies these rows by their text.
@@ -34,9 +33,11 @@ public struct ImportPlan {
         items = []
         var nameMaps: [EntryKind: [String: String]] = [:]
         for kind in EntryKind.importOrder {
-            let reserved = Set(target.entries(kind).map(\.name) + resolved.entries(kind).map(\.name))
-            for entry in resolved.entries(kind) {
-                let existing = target.entry(kind, named: entry.name)
+            let existingEntries = target.entriesByName(kind)
+            let incomingEntries = resolved.entries(kind)
+            let reserved = Set(existingEntries.keys).union(incomingEntries.map(\.name))
+            for entry in incomingEntries {
+                let existing = existingEntries[entry.name]
                 var comparable = entry.node
                 if kind == .contexts { Self.rewriteContext(&comparable, maps: nameMaps) }
                 let identical = existing?.node.isEquivalent(to: comparable) ?? false
@@ -52,24 +53,31 @@ public struct ImportPlan {
     public func merged(into target: KubeDocument) throws -> KubeDocument {
         var result = target
         var maps: [EntryKind: [String: String]] = [:]
+        var skipped: [EntryKind: Set<String>] = [:]
+        var claimed: [EntryKind: [String: String]] = [:]
         for item in items {
             let destination = item.action == .rename ? item.destinationName.trimmingCharacters(in: .whitespacesAndNewlines) : item.originalName
             guard !destination.isEmpty else { throw ConfigError.invalid("Every imported entry needs a destination name.") }
             maps[item.kind, default: [:]][item.originalName] = destination
+            if item.action == .skip { skipped[item.kind, default: []].insert(item.originalName) }
+            else { claimed[item.kind, default: [:]][destination] = item.originalName }
         }
         for kind in EntryKind.importOrder {
-            var list = result.entries(kind).map(\.node)
+            let existingEntries = result.entries(kind)
+            var list = existingEntries.map(\.node)
+            var indices = Dictionary(uniqueKeysWithValues: existingEntries.enumerated().map { ($0.element.name, $0.offset) })
+            let incomingEntries = incoming.entriesByName(kind)
             var destinations = Set<String>()
             for item in items where item.kind == kind && item.action != .skip {
                 let destination = maps[kind]![item.originalName]!
                 guard destinations.insert(destination).inserted else { throw ConfigError.invalid("Two imported \(kind.rawValue) resolve to ‘\(destination)’. Choose unique destination names.") }
-                var node = incoming.entry(kind, named: item.originalName)!.node
+                var node = incomingEntries[item.originalName]!.node
                 node["name"] = KubeDocument.string(destination)
                 if kind == .contexts {
-                    try checkSkippedReferences(of: node, maps: maps)
+                    try Self.checkSkippedReferences(of: node, skipped: skipped, claimed: claimed)
                     Self.rewriteContext(&node, maps: maps)
                 }
-                let existing = list.firstIndex { $0["name"]?.string == destination }
+                let existing = indices[destination]
                 switch item.action {
                 case .skip: break
                 case .reuse:
@@ -77,9 +85,11 @@ public struct ImportPlan {
                         throw ConfigError.invalid("‘\(item.originalName)’ is no longer identical after reference changes. Rename or replace it instead.")
                     }
                 case .replace:
-                    if let existing { list[existing] = node } else { list.append(node) }
+                    if let existing { list[existing] = node }
+                    else { indices[destination] = list.count; list.append(node) }
                 case .rename:
                     guard existing == nil else { throw ConfigError.invalid("‘\(destination)’ already exists. Choose another name or Replace.") }
+                    indices[destination] = list.count
                     list.append(node)
                 }
             }
@@ -93,24 +103,17 @@ public struct ImportPlan {
                 result.root[pair.key] = try result.root[pair.key].map { try Self.mergeMetadata($0, pair.value, path: key) } ?? pair.value
             }
         }
-        if activateImportedContext, !incoming.currentContext.isEmpty {
-            let name = incoming.currentContext
-            guard let item = items.first(where: { $0.kind == .contexts && $0.originalName == name }), item.action != .skip else {
-                throw ConfigError.invalid("‘\(name)’ isn’t being imported, so it can’t be made active. Import it or turn off activation.")
-            }
-            try result.setCurrentContext(maps[.contexts]![name]!)
-        }
         try result.validate()
         return result
     }
 
     /// A skipped entry keeps its name in references, which mustn't then land on another entry renamed to it.
-    private func checkSkippedReferences(of context: Node, maps: [EntryKind: [String: String]]) throws {
+    private static func checkSkippedReferences(of context: Node, skipped: [EntryKind: Set<String>], claimed: [EntryKind: [String: String]]) throws {
         for kind in EntryKind.referenced {
             guard let reference = context["context"]?[kind.singular]?.text,
-                  items.contains(where: { $0.kind == kind && $0.action == .skip && $0.originalName == reference }),
-                  let other = items.first(where: { $0.kind == kind && $0.action != .skip && maps[kind]?[$0.originalName] == reference }) else { continue }
-            throw ConfigError.invalid("Context ‘\(context["name"]?.string ?? "")’ refers to the skipped \(kind.singular) ‘\(reference)’, and ‘\(other.originalName)’ would take that name. Import ‘\(reference)’ or choose another name.")
+                  skipped[kind]?.contains(reference) == true,
+                  let other = claimed[kind]?[reference] else { continue }
+            throw ConfigError.invalid("Context ‘\(context["name"]?.string ?? "")’ refers to the skipped \(kind.singular) ‘\(reference)’, and ‘\(other)’ would take that name. Import ‘\(reference)’ or choose another name.")
         }
     }
 

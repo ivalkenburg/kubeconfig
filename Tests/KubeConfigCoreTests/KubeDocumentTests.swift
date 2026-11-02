@@ -145,6 +145,46 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertEqual(doc.root["e"]?.tag, Tag(.null))
     }
 
+    func testRawAmbiguousScalarsAreRejectedInStringFieldsButQuotedValuesWork() throws {
+        for value in ["y", "Y", "n", "N", "0X1F", "0B11", "0O17", "+.5", "-.5", ".5e3", "+_1", "-_1"] {
+            let raw = try KubeDocument(yaml: "users: [{name: u, user: {token: \(value)}}]")
+            XCTAssertTrue(raw.validationIssues.contains { $0.contains("token") && $0.contains("must be a string") }, value)
+            let quoted = try KubeDocument(yaml: "users: [{name: u, user: {token: '\(value)'}}]")
+            XCTAssertEqual(quoted.validationIssues, [], value)
+            let reloaded = try KubeDocument(yaml: quoted.serialized())
+            XCTAssertEqual(reloaded.entry(.users, named: "u")?.value("token"), value)
+            XCTAssertEqual(reloaded.validationIssues, [], value)
+        }
+    }
+
+    func testBooleanFlagsFollowClientGoIncludingSingleLetterValues() throws {
+        for (expected, values) in [(true, ["y", "Y", "yes", "Yes", "YES", "true", "on"]),
+                                   (false, ["n", "N", "no", "No", "NO", "false", "off"])] {
+            for value in values {
+                let yaml = "clusters: [{name: c, cluster: {server: 'https://c.invalid', insecure-skip-tls-verify: \(value)}}]"
+                let doc = try KubeDocument(yaml: yaml)
+                XCTAssertEqual(doc.validationIssues, [], value)
+                XCTAssertEqual(doc.entry(.clusters, named: "c")?.booleanValue("insecure-skip-tls-verify"), expected, value)
+                let reloaded = try KubeDocument(yaml: doc.serialized())
+                XCTAssertEqual(reloaded.entry(.clusters, named: "c")?.booleanValue("insecure-skip-tls-verify"), expected, value)
+            }
+        }
+        let quoted = try KubeDocument(yaml: "clusters: [{name: c, cluster: {server: 'https://c.invalid', insecure-skip-tls-verify: 'y'}}]")
+        XCTAssertNil(quoted.entry(.clusters, named: "c")?.booleanValue("insecure-skip-tls-verify"))
+        XCTAssertFalse(quoted.validationIssues.isEmpty)
+    }
+
+    func testOpaqueScalarTypesFollowClientGoAndSurviveSerialization() throws {
+        for (value, tag) in [("y", Tag(.bool)), ("n", Tag(.bool)), ("0X1F", Tag(.int)),
+                             ("0B11", Tag(.int)), ("0O17", Tag(.int)), ("+.5", Tag(.float)), (".5e3", Tag(.float))] {
+            let doc = try KubeDocument(yaml: "vendor: {value: \(value)}")
+            XCTAssertEqual(doc.root["vendor"]?["value"]?.tag, tag, value)
+            let reloaded = try KubeDocument(yaml: doc.serialized())
+            XCTAssertEqual(reloaded.root["vendor"]?["value"]?.tag, tag, value)
+            XCTAssertEqual(reloaded.root["vendor"]?["value"]?.string, value)
+        }
+    }
+
     func testTagsSerializationWouldLoseBlockApply() throws {
         for (value, tag) in [("!!binary aGVsbG8=", "!!binary"), ("!custom foo", "!custom"), ("!!int \"5\"", "!!int"), ("!!timestamp 2024-01-01", "!!timestamp")] {
             let doc = try KubeDocument(yaml: "apiVersion: v1\nkind: Config\nusers:\n- name: u\n  user:\n    extra: \(value)\n")

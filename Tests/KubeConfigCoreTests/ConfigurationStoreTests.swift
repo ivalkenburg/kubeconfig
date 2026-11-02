@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import KubeConfigCore
 
@@ -282,6 +283,68 @@ final class ConfigurationStoreTests: FileTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["folder"])
     }
 
+    func testLoadingRefusesPipesDirectoriesAndOversizedFiles() throws {
+        let pipe = directory.appendingPathComponent("pipe")
+        XCTAssertEqual(mkfifo(pipe.path, 0o600), 0)
+        for url in [pipe, directory!] {
+            XCTAssertThrowsError(try store.load(url)) {
+                XCTAssertEqual(($0 as? POSIXError)?.code, .EFTYPE)
+            }
+        }
+        XCTAssertTrue(FileManager.default.createFile(atPath: config.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: config)
+        try handle.truncate(atOffset: UInt64(KubeDocument.maximumByteCount) * 8)
+        try handle.close()
+        XCTAssertThrowsError(try store.load(config)) {
+            XCTAssertEqual($0 as? ConfigError, .invalid("Configuration exceeds the 16 MB size limit."))
+        }
+    }
+
+    func testNonRegularAndOversizedExternalReplacementsAreConflicts() throws {
+        try writeInitial()
+        let snapshot = try store.load(config)
+        try FileManager.default.removeItem(at: config)
+        XCTAssertEqual(mkfifo(config.path, 0o600), 0)
+        XCTAssertTrue(try store.hasChanged(snapshot))
+        XCTAssertThrowsError(try store.apply(Fixtures.changed(), over: snapshot, retention: 10)) {
+            XCTAssertEqual($0 as? ConfigError, .externalChange)
+        }
+        var information = stat()
+        XCTAssertEqual(lstat(config.path, &information), 0)
+        XCTAssertEqual(information.st_mode & S_IFMT, S_IFIFO)
+        try FileManager.default.removeItem(at: config)
+        XCTAssertTrue(FileManager.default.createFile(atPath: config.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: config)
+        let size = UInt64(KubeDocument.maximumByteCount) * 8
+        try handle.truncate(atOffset: size)
+        try handle.close()
+        XCTAssertTrue(try store.hasChanged(snapshot))
+        XCTAssertThrowsError(try store.apply(Fixtures.changed(), over: snapshot, retention: 10)) {
+            XCTAssertEqual($0 as? ConfigError, .externalChange)
+        }
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: config.path)[.size] as? UInt64, size)
+        XCTAssertTrue(try backups.records(for: config).records.isEmpty)
+    }
+
+    func testConditionalReplacementRefusesPipesAndLargerContents() throws {
+        XCTAssertEqual(mkfifo(config.path, 0o600), 0)
+        let files = LocalFileAccess()
+        let expected = Data("old".utf8)
+        XCTAssertThrowsError(try files.replaceIfUnchanged(Data("new".utf8), at: config, expectedContents: expected)) {
+            XCTAssertEqual($0 as? ConfigError, .externalChange)
+        }
+        var information = stat()
+        XCTAssertEqual(lstat(config.path, &information), 0)
+        XCTAssertEqual(information.st_mode & S_IFMT, S_IFIFO)
+        try FileManager.default.removeItem(at: config)
+        try Data("longer external contents".utf8).write(to: config)
+        XCTAssertThrowsError(try files.replaceIfUnchanged(Data("new".utf8), at: config, expectedContents: expected)) {
+            XCTAssertEqual($0 as? ConfigError, .externalChange)
+        }
+        XCTAssertEqual(try diskText(), "longer external contents")
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.hasSuffix(".tmp") })
+    }
+
     func testBoundedReadReportsAFileItCannotOpen() throws {
         try writeInitial()
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: config.path)
@@ -301,12 +364,12 @@ final class ConfigurationStoreTests: FileTestCase {
 }
 
 private struct MinimalFiles: FileAccess {
-    func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data? { try LocalFileAccess().read(url, maximumByteCount: maximumByteCount) }
     func writeAtomically(_ data: Data, to url: URL) throws { try LocalFileAccess().writeAtomically(data, to: url) }
 }
 
 private struct FailingWrites: FileAccess {
-    func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data? { try LocalFileAccess().read(url, maximumByteCount: maximumByteCount) }
     func writeAtomically(_ data: Data, to url: URL) throws { throw CocoaError(.fileWriteNoPermission) }
 }
 
@@ -315,7 +378,7 @@ private final class ObservingFiles: FileAccess {
     let expectedNamespace: String
     var observedAppliedConfig = false
     init(config: URL, expectedNamespace: String) { self.config = config; self.expectedNamespace = expectedNamespace }
-    func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data? { try LocalFileAccess().read(url, maximumByteCount: maximumByteCount) }
     func writeAtomically(_ data: Data, to url: URL) throws {
         let doc = try KubeDocument(yaml: String(contentsOf: config, encoding: .utf8))
         observedAppliedConfig = doc.entry(.contexts, named: "development")?.value("namespace") == expectedNamespace

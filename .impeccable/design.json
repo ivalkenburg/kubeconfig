@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-30T09:15:14.323121+00:00",
+  "generatedAt": "2026-11-02T23:00:53.982173+00:00",
   "title": "Design System: KubeConfig",
   "extensions": {
     "platform": {
@@ -80,14 +80,57 @@
           680,
           600
         ],
-        "import": [
-          800,
-          680
-        ],
+        "import": {
+          "width": 840,
+          "height": {
+            "minimum": 320,
+            "maximum": 580,
+            "formula": "min(580, max(320, 210 + 56 * itemCount + (resolvedPaths.isEmpty ? 0 : 100)))",
+            "threeEntriesWithoutResolvedPaths": 378
+          }
+        },
         "settings": [
           480,
           320
         ]
+      },
+      "entryRow": {
+        "height": "Intrinsic vertical height; minimum inner height 40 points",
+        "verticalPadding": 5,
+        "symbolAlignment": "Vertically centered beside the name and caption subtitle",
+        "textStructure": "Medium-weight name and caption subtitle, both single-line with middle truncation"
+      },
+      "importTable": {
+        "columns": {
+          "entry": "Remaining width",
+          "status": 95,
+          "action": 120,
+          "importAs": 225
+        },
+        "horizontalGap": 16,
+        "order": [
+          "contexts",
+          "clusters",
+          "users"
+        ],
+        "fixedRegions": [
+          "Title and one explanatory line",
+          "Column heading",
+          "Validation above a single row of right-aligned bottom actions"
+        ],
+        "scrollingContent": [
+          "Entry rows",
+          "Resolved file paths"
+        ],
+        "actionAlignment": "Leading; all cells vertically centered",
+        "importedYAMLPreview": false,
+        "destination": "Separate Import as column beside the action menu; editable only for Rename, secondary text for other actions, em dash for Skip",
+        "entry": "Original name and quiet kind caption without an icon",
+        "verticalRowPadding": 12,
+        "summaryCounts": false,
+        "footerExplanation": false,
+        "trailingRowDivider": false,
+        "activationOption": false
       }
     },
     "nativeEffects": {
@@ -108,7 +151,13 @@
         ".impeccable/review/contexts-light.png",
         ".impeccable/review/contexts-dark.png",
         ".impeccable/review/contexts-pending.png",
-        ".impeccable/review/yaml.png"
+        ".impeccable/review/yaml.png",
+        ".impeccable/review/import.png",
+        ".impeccable/review/import-review/import-single-light.png",
+        ".impeccable/review/import-review/import-single-dark.png",
+        ".impeccable/review/import-review/imported-context-dark.png",
+        ".impeccable/review/import-review/imported-context-light.png",
+        ".impeccable/review/import-review/imported-context-compact.png"
       ],
       "identityAsset": "Assets/AppIcon.png"
     }
@@ -179,11 +228,11 @@
     {
       "name": "Notice bar",
       "kind": "custom",
-      "description": "Symbol, wrapping callout, optional actions, and adaptive tint.",
+      "description": "Vertically centered symbol, wrapping callout, optional actions, and adaptive tint.",
       "nativeImplementation": {
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/MainView.swift",
-        "pattern": "NoticeBar<Actions>: HStack(...).padding(14).background(tint.opacity(0.07)); Divider()"
+        "pattern": "NoticeBar<Actions>: HStack(alignment: .center, spacing: 10).padding(14).background(tint.opacity(0.07)); Divider()"
       },
       "refersTo": "notice-bar"
     },
@@ -205,6 +254,26 @@
         "language": "SwiftUI",
         "source": "Sources/KubeConfig/YAMLEditor.swift",
         "pattern": "NSViewRepresentable wrapping NSTextView with an NSRulerView"
+      }
+    },
+    {
+      "name": "Import review",
+      "kind": "custom",
+      "description": "Aligned Entry, Status, Action, and Import as table with contexts first, fixed headings and footer, and scrollable rows. No summary counts. Short native menus default to Add for new entries and Reuse for identical entries. Rename edits the destination inline beside its menu; other actions show secondary destination text, with an em dash for Skip. Replacement warnings, validation, and resolved paths remain; no imported-YAML preview.",
+      "nativeImplementation": {
+        "language": "SwiftUI",
+        "source": "Sources/KubeConfig/Sheets.swift",
+        "pattern": "ImportSheet: HStack(alignment: .center, spacing: 16); flexible Entry, Status width 95, Action width 120, Import as width 225; native menu Picker and inline conditional rounded-border TextField; 12-point vertical row padding; content-sized sheet capped at 580 points; right-aligned buttons share one footer row; dividers only between entries"
+      }
+    },
+    {
+      "name": "Entry row",
+      "kind": "custom",
+      "description": "Vertically centered section symbol beside a medium-weight name and caption subtitle. Intrinsic vertical sizing and a minimum inner height preserve both text lines when inserted.",
+      "nativeImplementation": {
+        "language": "SwiftUI",
+        "source": "Sources/KubeConfig/MainView.swift",
+        "pattern": "EntryRow: HStack(spacing: 10) with VStack(alignment: .leading, spacing: 5); .fixedSize(horizontal: false, vertical: true).frame(minHeight: 40); list applies .padding(.vertical, 5)"
       }
     }
   ],

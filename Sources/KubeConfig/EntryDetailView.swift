@@ -49,7 +49,7 @@ struct EntryDetailView: View {
                             Label("An embedded CA certificate takes precedence over the file path.", systemImage: "lock.doc")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
-                        if entry?.fields["insecure-skip-tls-verify"]?.bool == true {
+                        if entry?.booleanValue("insecure-skip-tls-verify") == true {
                             Label("TLS verification is disabled in this configuration.", systemImage: "exclamationmark.triangle")
                                 .font(.caption).foregroundStyle(.orange)
                         }

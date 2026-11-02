@@ -474,6 +474,42 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testRawAmbiguousCredentialsBlockApplyUntilQuoted() async throws {
+        try await withModel { model, url in
+            for value in ["y", "0X1F", "+.5", ".5e3"] {
+                let raw = Self.fixture.replacingOccurrences(of: "users: []", with: "users: [{name: u, user: {token: \(value)}}]")
+                model.editRaw(raw)
+                XCTAssertNil(model.parseIssue)
+                XCTAssertTrue(model.validationIssues.contains { $0.contains("token") }, value)
+                XCTAssertFalse(model.canApply, value)
+                XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+                model.editRaw(raw.replacingOccurrences(of: "token: \(value)", with: "token: '\(value)'"))
+                XCTAssertEqual(model.validationIssues, [], value)
+                XCTAssertTrue(model.canApply, value)
+            }
+        }
+    }
+
+    func testImportDoesNotActivateItsCurrentContextWhenStagedOrApplied() async throws {
+        let incoming = Self.fixture.replacingOccurrences(of: "name: other", with: "name: imported")
+            .replacingOccurrences(of: "current-context: dev", with: "current-context: imported")
+        for immediate in [true, false] {
+            try await withModel(immediate: immediate) { model, url in
+                try model.prepareImport(yaml: incoming, directory: nil)
+                try model.acceptImport(XCTUnwrap(model.importPlan))
+                XCTAssertEqual(model.document?.currentContext, "dev")
+                XCTAssertNotNil(model.document?.entry(.contexts, named: "imported"))
+                XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+                XCTAssertTrue(model.canApply)
+                model.commit()
+                XCTAssertNil(model.errorMessage)
+                let saved = try KubeDocument(yaml: String(contentsOf: url, encoding: .utf8))
+                XCTAssertEqual(saved.currentContext, "dev")
+                XCTAssertNotNil(saved.entry(.contexts, named: "imported"))
+            }
+        }
+    }
+
     func testImportMergeErrorsRemainAvailableToTheSheetWithoutChangingDraft() async throws {
         try await withModel { model, _ in
             let incoming = try KubeDocument(yaml: "contexts: [{name: broken, context: {cluster: missing}}]")
@@ -3088,6 +3124,6 @@ extension AppModelTests {
 private final class StatusBox: @unchecked Sendable { var value: Int32? }
 
 private struct UnwritableBackups: FileAccess {
-    func read(_ url: URL) throws -> Data? { try LocalFileAccess().read(url) }
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data? { try LocalFileAccess().read(url, maximumByteCount: maximumByteCount) }
     func writeAtomically(_ data: Data, to url: URL) throws { throw CocoaError(.fileWriteNoPermission) }
 }

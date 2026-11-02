@@ -56,6 +56,15 @@ public struct ConfigEntry: Identifiable, Equatable {
     public var id: String { name }
     public var fields: Node { node[kind.singular] ?? .emptyMapping }
     public func value(_ key: String) -> String { fields[key]?.text ?? "" }
+    /// client-go accepts y/n as booleans; Yams' Bool accessor omits those spellings.
+    public func booleanValue(_ key: String) -> Bool? {
+        guard let value = fields[key], value.tag == Tag(.bool) else { return nil }
+        switch value.string?.lowercased() {
+        case "true", "yes", "y", "on": return true
+        case "false", "no", "n", "off": return false
+        default: return nil
+        }
+    }
     /// Whether the field holds anything but a YAML null, which counts as leaving it out.
     public func has(_ key: String) -> Bool { fields[key].map { $0.tag != Tag(.null) } ?? false }
     public var authenticationSummary: String {
@@ -74,8 +83,9 @@ public struct KubeDocument: Equatable {
     private static let maximumNodeCount = 1_000_000
     /// kubectl reads dates, `12:30` and `=` as strings, so Yams' rules for them would refuse working files.
     private static let resolver = try! Resolver.default.removing(.timestamp).removing(.value)
-        .replacing(.int, with: #"^(?:[-+]?0b[0-1_]+|[-+]?0o?[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|[-+]?0x[0-9a-fA-F_]+)$"#)
-        .replacing(.float, with: #"^(?:[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?|\.[0-9_]+(?:[eE][-+][0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$"#)
+        .replacing(.bool, with: #"^(?:y|Y|n|N|yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF)$"#)
+        .replacing(.int, with: #"^(?:(?:[-+]_*)?0[bB][0-1_]+|(?:[-+]_*)?0[oO]?[0-7_]+|(?:[-+]_*)?(?:0|[1-9][0-9_]*)|(?:[-+]_*)?0[xX][0-9a-fA-F_]+)$"#)
+        .replacing(.float, with: #"^(?:(?:[-+]_*)?(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9_]+)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$"#)
 
     public internal(set) var root: Node
 

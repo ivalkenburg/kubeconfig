@@ -28,7 +28,7 @@ import KubeConfigCore
                 await wait(milliseconds)
                 if let sheet = window.attachedSheet { save(sheet, to: folder.appendingPathComponent("\(name).png")) }
             }
-            NSApp.activate()
+            NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             setAppearance(.aqua)
             window.setContentSize(NSSize(width: 1120, height: 740))
@@ -118,6 +118,48 @@ import KubeConfigCore
             try? model.prepareImport(yaml: imported, directory: model.snapshot?.url.deletingLastPathComponent())
             await sheetShot("import", after: 500)
             model.closeImport()
+            await wait(400)
+            // One-context import: a new context, a conflicting cluster, and an identical user.
+            let singleContext = """
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - name: development
+              cluster:
+                server: https://imported.example.invalid:6443
+            users:
+            - name: developer
+              user:
+                exec:
+                  apiVersion: client.authentication.k8s.io/v1
+                  command: example-credential-plugin
+                  interactiveMode: Never
+            contexts:
+            - name: bbl-pedalpro
+              context:
+                cluster: development
+                user: developer
+            current-context: bbl-pedalpro
+            """
+            do {
+                try model.prepareImport(yaml: singleContext, directory: explicitURL.deletingLastPathComponent())
+                await sheetShot("import-single-light", after: 500)
+                setAppearance(.darkAqua)
+                await sheetShot("import-single-dark", after: 400)
+                if let plan = model.importPlan {
+                    try model.acceptImport(plan)
+                    model.selectEntry("bbl-pedalpro")
+                    await shot("imported-context-dark", after: 500)
+                    setAppearance(.aqua)
+                    await shot("imported-context-light", after: 400)
+                    window.setContentSize(NSSize(width: 920, height: 600))
+                    await shot("imported-context-compact", after: 400)
+                }
+            } catch {
+                // Fixtures are synthetic, but keep capture failures visible to the caller.
+                try? Data(error.localizedDescription.utf8).write(to: folder.appendingPathComponent("import-capture-error.txt"))
+                model.closeImport()
+            }
             model.discardDraft()
             await wait(300)
             NSApplication.shared.terminate(nil)

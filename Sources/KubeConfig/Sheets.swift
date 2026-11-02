@@ -158,101 +158,165 @@ struct ImportSheet: View {
     @ObservedObject var model: AppModel
     @State private var plan: ImportPlan
     @State private var issue: String?
-    /// Fixed for the sheet's lifetime, so typing a destination name doesn't color it all over again.
-    private let importedYAML: AttributedString
+    @State private var renamedNewEntries: Set<Int> = []
+
+    private let rowIndices: [Int]
+    private let statusWidth: CGFloat = 95
+    private let actionWidth: CGFloat = 120
+    private let destinationWidth: CGFloat = 225
+
+    /// Add and Rename share the core's rename action; the review only opens a name field on request.
+    private enum ReviewAction: Hashable {
+        case add, rename, replace, skip, reuse
+    }
 
     init(model: AppModel, initialPlan: ImportPlan) {
         self.model = model
         _plan = State(initialValue: initialPlan)
-        importedYAML = YAMLStyle.attributed((try? initialPlan.incoming.serialized()) ?? "")
+        rowIndices = EntryKind.allCases.flatMap { kind in
+            initialPlan.items.indices.filter { initialPlan.items[$0].kind == kind }
+        }
+        _renamedNewEntries = State(initialValue: Set(initialPlan.items.indices.filter {
+            let item = initialPlan.items[$0]
+            return !item.conflicts && item.destinationName != item.originalName
+        }))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 9) {
                 Text("Review import").font(.title2).fontWeight(.semibold)
-                Text("Existing entries stay intact unless you choose Replace.")
+                Text("Changes stay in your draft until you Apply.")
                     .font(.callout).foregroundStyle(.secondary)
             }.padding(24)
             Divider()
+            columns {
+                Text("Entry").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Status").frame(width: statusWidth, alignment: .leading)
+                Text("Action").frame(width: actionWidth, alignment: .leading)
+                Text("Import as").frame(width: destinationWidth, alignment: .leading)
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            .padding(.horizontal, 24).padding(.vertical, 12)
+            Divider().padding(.horizontal, 24)
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    ForEach(EntryKind.importOrder) { kind in
-                        let indices = plan.items.indices.filter { plan.items[$0].kind == kind }
-                        if !indices.isEmpty {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Label(kind.title, systemImage: kind.symbol).font(.headline)
-                                ForEach(indices, id: \.self) { index in
-                                    importRow(index)
-                                    if index != indices.last { Divider() }
-                                }
-                            }
-                        }
+                VStack(alignment: .leading, spacing: 0) {
+                    // Show contexts first while the core still merges dependencies first.
+                    ForEach(rowIndices, id: \.self) { index in
+                        importRow(index)
+                        if index != rowIndices.last { Divider() }
                     }
-                    if plan.items.isEmpty { Text("This import contains only configuration metadata.").foregroundStyle(.secondary) }
+                    if plan.items.isEmpty {
+                        Text("This import contains only configuration metadata.")
+                            .foregroundStyle(.secondary).padding(.vertical, 16)
+                    }
                     if !plan.resolvedPaths.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
                             Label("Resolved file paths", systemImage: "folder").font(.headline)
                             ForEach(plan.resolvedPaths, id: \.self) { path in
                                 Text(path).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                        }
+                        }.padding(.vertical, 20)
                     }
-                    DisclosureGroup("Imported configuration") {
-                        Text(importedYAML)
-                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }.padding(24)
+                }.padding(.horizontal, 24)
             }
             Divider()
             VStack(alignment: .leading, spacing: 12) {
-                if !plan.incoming.currentContext.isEmpty {
-                    Toggle("Make imported ‘\(plan.incoming.currentContext)’ active after Apply", isOn: $plan.activateImportedContext)
-                        .toggleStyle(.checkbox)
+                if let issue {
+                    Label(issue, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if let issue { Label(issue, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange) }
-                HStack {
+                HStack(spacing: 12) {
                     Spacer()
                     Button("Cancel", action: model.closeImport).keyboardShortcut(.cancelAction)
                     Button("Merge into Draft") {
-                        do {
-                            try model.acceptImport(plan)
-                        } catch { issue = error.localizedDescription }
+                        do { try model.acceptImport(plan) }
+                        catch { issue = error.localizedDescription }
                     }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 }
             }.padding(20)
-        }.frame(width: 800, height: 680)
+        }
+        .frame(width: 840, height: sheetHeight)
+    }
+
+    private func columns<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .center, spacing: 16, content: content)
+    }
+
+    private var sheetHeight: CGFloat {
+        let pathsHeight: CGFloat = plan.resolvedPaths.isEmpty ? 0 : 100
+        return min(580, max(320, 210 + CGFloat(plan.items.count) * 56 + pathsHeight))
+    }
+
+    private func reviewAction(_ index: Int) -> Binding<ReviewAction> {
+        Binding {
+            let item = plan.items[index]
+            switch item.action {
+            case .rename: return item.conflicts || renamedNewEntries.contains(index) ? .rename : .add
+            case .replace: return .replace
+            case .skip: return .skip
+            case .reuse: return .reuse
+            }
+        } set: { action in
+            issue = nil
+            switch action {
+            case .add:
+                plan.items[index].action = .rename
+                plan.items[index].destinationName = plan.items[index].originalName
+                renamedNewEntries.remove(index)
+            case .rename:
+                plan.items[index].action = .rename
+                renamedNewEntries.insert(index)
+            case .replace: plan.items[index].action = .replace
+            case .skip: plan.items[index].action = .skip
+            case .reuse: plan.items[index].action = .reuse
+            }
+        }
     }
 
     private func importRow(_ index: Int) -> some View {
         let item = plan.items[index]
+        let action = reviewAction(index)
         return VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(item.originalName).fontWeight(.medium).lineLimit(2)
-                    Text(item.identical ? "Identical entry exists" : item.conflicts ? "Name already exists" : "New entry")
-                        .font(.caption).foregroundStyle(item.conflicts && !item.identical ? Color.orange : .secondary)
+            columns {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.originalName).fontWeight(.medium).lineLimit(2).truncationMode(.middle)
+                        .help(item.originalName).textSelection(.enabled)
+                    Text(item.kind.singular.capitalized).font(.caption).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                Text(item.identical ? "Identical" : item.conflicts ? "Name conflict" : "New")
+                    .font(.caption).foregroundStyle(item.conflicts && !item.identical ? Color.orange : .secondary)
+                    .frame(width: statusWidth, alignment: .leading)
+                Picker("Action", selection: action) {
+                    if !item.conflicts { Text("Add").tag(ReviewAction.add) }
+                    Text("Rename").tag(ReviewAction.rename)
+                    if item.conflicts { Text("Replace").tag(ReviewAction.replace) }
+                    Text("Skip").tag(ReviewAction.skip)
+                    if item.identical { Text("Reuse").tag(ReviewAction.reuse) }
                 }
-                Spacer()
-                Picker("Action", selection: $plan.items[index].action) {
-                    Text(item.conflicts ? "Rename imported" : "Add").tag(ImportAction.rename)
-                    if item.conflicts { Text("Replace existing").tag(ImportAction.replace) }
-                    Text("Skip").tag(ImportAction.skip)
-                    if item.identical { Text("Reuse existing").tag(ImportAction.reuse) }
-                }.labelsHidden().frame(width: 165).accessibilityLabel("Import action for \(item.originalName)")
-            }
-            if item.action == .rename {
-                HStack {
-                    Text("Import as").font(.caption).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
-                    TextField("Destination name", text: $plan.items[index].destinationName).textFieldStyle(.roundedBorder)
-                }
+                .pickerStyle(.menu).labelsHidden().frame(width: actionWidth, alignment: .leading)
+                .accessibilityLabel("Import action for \(item.kind.singular) \(item.originalName)")
+                Group {
+                    if action.wrappedValue == .rename {
+                        TextField("Destination name", text: $plan.items[index].destinationName)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("Import \(item.kind.singular) \(item.originalName) as")
+                            .onChange(of: plan.items[index].destinationName) { issue = nil }
+                    } else {
+                        Text(item.action == .skip ? "—" : item.originalName)
+                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            .help(item.action == .skip ? "Not imported" : item.originalName)
+                    }
+                }.frame(width: destinationWidth, alignment: .leading)
             }
             if item.action == .replace {
                 Label("Existing contexts using this name will use the imported settings.", systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
-        }.padding(.vertical, 5)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, 12)
     }
 }
 

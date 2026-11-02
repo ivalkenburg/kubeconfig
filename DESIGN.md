@@ -66,11 +66,11 @@ YAML uses system colors by token: blue keys, green quoted and block strings, ora
 Use SwiftUI system typography, resolved by macOS. There is no custom display face or fixed type scale.
 
 - **Title:** `.title2` with semibold weight for detail and sheet titles.
-- **Section:** `.headline` for list and import-group headings.
+- **Section:** `.headline` for list and resolved-path headings.
 - **Body:** default system body; medium weight for entry names and backup timestamps.
 - **Supporting:** `.callout` for explanatory text; `.subheadline` for compact summaries.
 - **Metadata:** `.caption` for paths, counts, row subtitles, status, and form footers.
-- **Code:** system monospaced at the system font size for editable YAML, `.callout` for diffs and backup previews, and `.caption` for import previews and paths.
+- **Code:** system monospaced at the system font size for editable YAML, `.callout` for diffs and backup previews, and `.caption` for paths.
 
 Font sizes, leading, and control labels remain platform-owned. SF Symbols follow their surrounding type role.
 
@@ -86,7 +86,7 @@ YAML mode drops the entry list, gives the editor the full width, and adds a Wrap
 
 Use the frontmatter spacing vocabulary for repeated custom regions. List rows pair medium-weight names with caption metadata. Sheet headers use the header inset; sheet action bars and preview areas commonly use the panel inset. Native grouped forms own their internal row metrics.
 
-Review, import source, and import review sheets are respectively 780 × 620, 680 × 600, and 800 × 680 points. Settings use a 480 × 320-point grouped form. These are implemented surface sizes, not general-purpose breakpoints.
+Review and import source sheets are respectively 780 × 620 and 680 × 600 points. Import review is 840 points wide; its height is `min(580, max(320, 210 + 56 × item count + paths allowance))`, with a 100-point allowance when resolved paths exist. A three-entry import without resolved paths is 378 points tall; larger imports scroll within the capped sheet. Settings use a 480 × 320-point grouped form. These are implemented surface sizes, not general-purpose breakpoints.
 
 ## Elevation & Depth
 
@@ -104,7 +104,7 @@ Use native `Button` and `SettingsLink`. Apply uses `.glassProminent`; sheet conf
 
 ### Navigation and Lists
 
-Use `NavigationSplitView`, `.sidebar` navigation, and `.inset` entry/backup lists. SF Symbols identify sections; selection and active-context state are separate. The active context has a labeled checkmark. Long names and row subtitles truncate in the middle; detail titles may use two lines.
+Use `NavigationSplitView`, `.sidebar` navigation, and `.inset` entry/backup lists. SF Symbols identify sections; selection and active-context state are separate. The active context has a labeled checkmark. Long names and row subtitles truncate in the middle; detail titles may use two lines. Entry rows preserve their intrinsic vertical height, with a minimum inner height of 40 points and 5-point top and bottom padding. Keep the section symbol vertically centered beside the medium-weight name and caption subtitle, including immediately after insertion.
 
 Row actions live in right-click menus, so forms hold only fields. A delete that isn't possible stays visible but disabled, with its reason.
 
@@ -118,11 +118,19 @@ Use `.grouped` `Form`, `Section`, `TextField`, `Picker`, and `LabeledContent`. C
 
 ### Notices and Empty States
 
-`NoticeBar` combines an SF Symbol, wrapping callout text, optional actions, tint wash, and divider. Warnings include explanatory text. Notices cover a failed backup, a file changed outside the app, damaged backups, a failed k9s, and a k9s session that's out of date. `ContentUnavailableView` supplies missing-file, repair, unselected, and history states with contextual actions.
+`NoticeBar` combines an SF Symbol, wrapping callout text, optional actions, tint wash, and divider. The symbol, text, and action buttons align vertically to the center, including when text wraps. Warnings include explanatory text. Notices cover a failed backup, a file changed outside the app, damaged backups, a failed k9s, and a k9s session that's out of date. `ContentUnavailableView` supplies missing-file, repair, unselected, and history states with contextual actions.
 
 ### YAML, Diffs, and Review Sheets
 
 An `NSTextView` supports raw YAML, with syntax colors, a line-number gutter, a find bar, optional line wrapping, and a red marker on the parse error line. Previews use selectable, syntax-colored monospaced text and two-axis scrolling. Diff lines retain +/− prefixes and status tint. Use an eager stack for wrapped diff lines, since a lazy stack's height estimates make scrolling jump. Review groups neighboring changed lines into steps: circular glass up and down buttons move between them, and the current step takes a stronger tint. Sheets separate explanation, scrollable content, and bottom actions with dividers; Cancel and the confirmation action use native keyboard behavior.
+
+### Import Review
+
+A compact table aligns Entry, Status, Action, and Import as across its fixed heading and scrollable rows, with contexts first. Entry takes the remaining width; Status is 95 points, Action is 120 points, Import as is 225 points, and horizontal gaps are 16 points. Each Entry cell shows its original name and a quiet kind caption without an icon. All cells align vertically to the center, with 12-point top and bottom row padding. Dividers separate entries; the final entry has no trailing divider.
+
+Native action menus align to the left and use short labels: Add, Rename, Replace, Skip, and Reuse. New entries default to Add and also offer Rename; identical entries default to Reuse. Rename makes the destination editable inline in the Import as column beside the menu. Other actions show the final name as secondary text; Skip shows an em dash. Replacement warnings appear beneath the row; resolved file paths remain selectable in the scrolling content.
+
+The title has one explanatory line, followed directly by the column heading without summary counts. Cancel and Merge into Draft align to the right of one fixed footer row, with validation errors above it and no repeated footer explanation. Import review keeps the active context unchanged and has no activation option, imported-YAML disclosure, preview, or syntax highlighting.
 
 ### k9s Terminal
 

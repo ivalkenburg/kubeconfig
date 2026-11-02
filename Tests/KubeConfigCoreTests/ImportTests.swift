@@ -51,6 +51,47 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(merged.entry(.contexts, named: "development")!.value("cluster"), "dev")
     }
 
+    func testMixedActionsPreserveOrderAndRewriteOnlyImportedReferences() throws {
+        let target = try KubeDocument(yaml: """
+        clusters:
+        - {name: renamed, cluster: {server: 'https://old.invalid'}}
+        - {name: replaced, cluster: {server: 'https://old.invalid'}}
+        - {name: shared, cluster: {server: 'https://shared.invalid'}}
+        - {name: skipped, cluster: {server: 'https://kept.invalid'}}
+        contexts: [{name: active, context: {cluster: shared}}]
+        current-context: active
+        """)
+        let incoming = try KubeDocument(yaml: """
+        clusters:
+        - {name: renamed, cluster: {server: 'https://renamed.invalid'}}
+        - {name: replaced, cluster: {server: 'https://replacement.invalid'}}
+        - {name: shared, cluster: {server: 'https://shared.invalid'}}
+        - {name: skipped, cluster: {server: 'https://ignored.invalid'}}
+        - {name: added, cluster: {server: 'https://added.invalid'}}
+        contexts:
+        - {name: use-renamed, context: {cluster: renamed}}
+        - {name: use-replaced, context: {cluster: replaced}}
+        - {name: use-shared, context: {cluster: shared}}
+        - {name: use-skipped, context: {cluster: skipped}}
+        - {name: use-added, context: {cluster: added}}
+        """)
+        var plan = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil)
+        plan.items[0].destinationName = "chosen"
+        plan.items[1].action = .replace
+        XCTAssertEqual(plan.items[2].action, .reuse)
+        plan.items[3].action = .skip
+        let merged = try plan.merged(into: target)
+        XCTAssertEqual(merged.entries(.clusters).map(\.name), ["renamed", "replaced", "shared", "skipped", "chosen", "added"])
+        XCTAssertEqual(merged.entry(.clusters, named: "renamed")?.value("server"), "https://old.invalid")
+        XCTAssertEqual(merged.entry(.clusters, named: "replaced")?.value("server"), "https://replacement.invalid")
+        XCTAssertEqual(merged.entry(.clusters, named: "skipped")?.value("server"), "https://kept.invalid")
+        XCTAssertEqual(merged.entry(.contexts, named: "use-renamed")?.value("cluster"), "chosen")
+        for name in ["replaced", "shared", "skipped", "added"] {
+            XCTAssertEqual(merged.entry(.contexts, named: "use-" + name)?.value("cluster"), name)
+        }
+        XCTAssertEqual(merged.currentContext, "active")
+    }
+
     func testSkippingRequiredNewClusterBlocksImport() throws {
         let target = KubeDocument.empty
         var plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
@@ -59,15 +100,14 @@ final class ImportTests: XCTestCase {
         XCTAssertEqual(target.entries(.clusters).count, 0)
     }
 
-    func testCustomDestinationNameAndActivation() throws {
+    func testCustomDestinationNameKeepsActiveContextEmpty() throws {
         let target = KubeDocument.empty
         var plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
         let clusterIndex = plan.items.firstIndex { $0.kind == .clusters }!
         plan.items[clusterIndex].destinationName = "chosen"
-        plan.activateImportedContext = true
         let result = try plan.merged(into: target)
         XCTAssertEqual(result.entry(.contexts, named: "development")!.value("cluster"), "chosen")
-        XCTAssertEqual(result.currentContext, "development")
+        XCTAssertEqual(result.currentContext, "")
     }
 
     func testImportResolvesFileAndRelativePluginPathsButNotBareCommands() throws {
@@ -228,35 +268,39 @@ final class ImportTests: XCTestCase {
         XCTAssertThrowsError(try plan.merged(into: target)) { XCTAssertTrue($0.localizedDescription.contains("no longer identical")) }
     }
 
-    func testActivationFollowsARenamedContext() throws {
+    func testImportingARenamedContextKeepsTheExistingActiveContext() throws {
         let target = try KubeDocument(yaml: Fixtures.yaml.replacingOccurrences(of: "namespace: default", with: "namespace: other"))
-        var plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
-        plan.activateImportedContext = true
-        XCTAssertEqual(try plan.merged(into: target).currentContext, "development-imported")
+        let plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
+        let merged = try plan.merged(into: target)
+        XCTAssertEqual(merged.currentContext, "development")
+        XCTAssertEqual(merged.entry(.contexts, named: "development")?.value("namespace"), "other")
+        XCTAssertEqual(merged.entry(.contexts, named: "development-imported")?.value("namespace"), "default")
     }
 
-    func testActivationCannotPointAtASkippedContext() throws {
+    func testSkippingTheIncomingActiveContextKeepsTheExistingActiveContext() throws {
         let target = try KubeDocument(yaml: Fixtures.yaml.replacingOccurrences(of: "namespace: default", with: "namespace: other"))
         var plan = try ImportPlan(target: target, incoming: Fixtures.document(), sourceDirectory: source)
-        plan.activateImportedContext = true
         plan.items[plan.items.firstIndex { $0.kind == .contexts && $0.originalName == "development" }!].action = .skip
-        XCTAssertThrowsError(try plan.merged(into: target)) { XCTAssertTrue($0.localizedDescription.contains("isn’t being imported")) }
+        let merged = try plan.merged(into: target)
+        XCTAssertEqual(merged.currentContext, "development")
+        XCTAssertNil(merged.entry(.contexts, named: "development-imported"))
     }
 
-    func testActivationCannotPointAtAContextTheImportLacks() throws {
-        let target = try KubeDocument(yaml: "contexts: [{name: elsewhere, context: {}}]\n")
-        var plan = try ImportPlan(target: target, incoming: KubeDocument(yaml: "current-context: elsewhere\n"), sourceDirectory: nil)
-        plan.activateImportedContext = true
-        XCTAssertThrowsError(try plan.merged(into: target)) { XCTAssertTrue($0.localizedDescription.contains("isn’t being imported")) }
+    func testIncomingCurrentContextIsIgnoredWhenNoContextsAreImported() throws {
+        let target = try Fixtures.document()
+        let incoming = try KubeDocument(yaml: "current-context: missing\n")
+        let plan = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil)
+        XCTAssertEqual(try plan.merged(into: target), target)
     }
 
-    func testActivationAcceptsAReusedContext() throws {
+    func testReusingAContextDoesNotActivateIt() throws {
         let shared = "clusters: [{name: c, cluster: {server: 'https://c.invalid'}}]\ncontexts: [{name: shared, context: {cluster: c}}]\n"
         let target = try KubeDocument(yaml: shared)
-        var plan = try ImportPlan(target: target, incoming: KubeDocument(yaml: shared + "current-context: shared\n"), sourceDirectory: nil)
-        plan.activateImportedContext = true
+        let plan = try ImportPlan(target: target, incoming: KubeDocument(yaml: shared + "current-context: shared\n"), sourceDirectory: nil)
         XCTAssertEqual(plan.items.last?.action, .reuse)
-        XCTAssertEqual(try plan.merged(into: target).currentContext, "shared")
+        let merged = try plan.merged(into: target)
+        XCTAssertEqual(merged.currentContext, "")
+        XCTAssertNil(merged.root["current-context"])
     }
 
     func testANullReferenceIsNotMistakenForAnEntryNamedNull() throws {
@@ -269,6 +313,19 @@ final class ImportTests: XCTestCase {
         let merged = try ImportPlan(target: target, incoming: incoming, sourceDirectory: nil).merged(into: target)
         XCTAssertEqual(merged.entry(.contexts, named: "x")?.value("user"), "")
         XCTAssertNotNil(merged.entry(.users, named: "null-imported"))
+    }
+
+    func testImportRejectsAmbiguousPlainCredentialsAndAcceptsQuotedOnes() throws {
+        for value in ["y", "n", "0X1F", "0B11", "+.5", ".5e3"] {
+            let incoming = try KubeDocument(yaml: "users: [{name: u, user: {token: \(value)}}]")
+            let plan = try ImportPlan(target: .empty, incoming: incoming, sourceDirectory: nil)
+            XCTAssertThrowsError(try plan.merged(into: .empty)) {
+                XCTAssertTrue($0.localizedDescription.contains("token"), value)
+            }
+            let quoted = try KubeDocument(yaml: "users: [{name: u, user: {token: '\(value)'}}]")
+            let merged = try ImportPlan(target: .empty, incoming: quoted, sourceDirectory: nil).merged(into: .empty)
+            XCTAssertEqual(merged.entry(.users, named: "u")?.value("token"), value)
+        }
     }
 
     func testImportRejectsWrongConfigurationKindAndVersion() throws {

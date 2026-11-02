@@ -438,8 +438,8 @@ private struct EntryRow: View {
     let changed: Bool
     let k9sStatus: String?
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: entry.kind.symbol).foregroundStyle(active ? Color.accentColor : .secondary).padding(.top, 2)
+        HStack(spacing: 10) {
+            Image(systemName: entry.kind.symbol).foregroundStyle(active ? Color.accentColor : .secondary)
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     Text(entry.name).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
@@ -451,6 +451,9 @@ private struct EntryRow: View {
                 Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
         }
+        // Preserve both text lines when List first measures an inserted row.
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(minHeight: 40)
     }
     private var subtitle: String {
         switch entry.kind {
@@ -523,7 +526,7 @@ struct NoticeBar<Actions: View>: View {
     let text: String
     @ViewBuilder var actions: Actions
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .center, spacing: 10) {
             Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
             // A fixed height here would have the window measure this wrapped at its narrowest, and overflow.
             Text(text).font(.callout)

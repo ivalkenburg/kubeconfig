@@ -3,14 +3,19 @@ import Darwin
 import Foundation
 
 public protocol FileAccess {
-    func read(_ url: URL) throws -> Data?
+    func read(_ url: URL, maximumByteCount: Int) throws -> Data?
     func writeAtomically(_ data: Data, to url: URL) throws
     func replaceIfUnchanged(_ data: Data, at url: URL, expectedContents: Data?) throws
 }
 
 public extension FileAccess {
+    fileprivate func matches(_ expected: Data?, at url: URL) throws -> Bool {
+        do { return try read(url, maximumByteCount: expected?.count ?? 0) == expected }
+        catch let error as POSIXError where error.code == .EFBIG || error.code == .EFTYPE { return false }
+    }
+
     func replaceIfUnchanged(_ data: Data, at url: URL, expectedContents: Data?) throws {
-        guard try read(url) == expectedContents else { throw ConfigError.externalChange }
+        guard try matches(expectedContents, at: url) else { throw ConfigError.externalChange }
         try writeAtomically(data, to: url)
     }
 }
@@ -20,12 +25,7 @@ public struct LocalFileAccess: FileAccess {
 
     private var lastError: POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
 
-    public func read(_ url: URL) throws -> Data? {
-        do { return try Data(contentsOf: url) }
-        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
-    }
-
-    /// Limits credential reads before allocating their contents, and never waits on a pipe or device.
+    /// Bounds regular-file reads before allocating their contents, without waiting on pipes or devices.
     public func read(_ url: URL, maximumByteCount: Int) throws -> Data? {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else {
@@ -74,7 +74,7 @@ public struct LocalFileAccess: FileAccess {
         }
         try handle.write(contentsOf: data)
         try handle.synchronize()
-        if let expected, try read(url) != expected { throw ConfigError.externalChange }
+        if let expected, try !matches(expected, at: url) { throw ConfigError.externalChange }
         // rename(2) replaces the destination atomically, leaving no partial kubeconfig.
         guard Darwin.rename(temporary.path, url.path) == 0 else { throw lastError }
         let parent = Darwin.open(directory.path, O_RDONLY)
@@ -186,7 +186,7 @@ public struct BackupStore {
     private func summaryURL(of url: URL) -> URL { url.deletingPathExtension().appendingPathExtension("meta") }
 
     private func savedSummary(of url: URL, for configuration: URL) -> BackupSummary? {
-        guard let data = try? files.read(summaryURL(of: url)),
+        guard let data = try? files.read(summaryURL(of: url), maximumByteCount: 64 * 1024),
               let summary = try? JSONDecoder().decode(BackupSummary.self, from: data),
               summary.configurationPath == configuration.standardizedFileURL.path,
               summary.id == url.deletingPathExtension().lastPathComponent else { return nil }
@@ -201,7 +201,9 @@ public struct BackupStore {
     }
 
     private func verifiedRecord(at url: URL, for configuration: URL) throws -> BackupRecord {
-        guard let data = try files.read(url), let record = try? JSONDecoder().decode(BackupRecord.self, from: data),
+        // Base64 and escaped slashes can expand a 16 MB payload to nearly three times its size.
+        guard let data = try? files.read(url, maximumByteCount: KubeDocument.maximumByteCount * 3 + 64 * 1024),
+              let record = try? JSONDecoder().decode(BackupRecord.self, from: data),
               record.configurationPath == configuration.standardizedFileURL.path,
               BackupRecord.hash(record.contents) == record.checksum,
               record.id == url.deletingPathExtension().lastPathComponent else {
@@ -273,14 +275,18 @@ public struct ConfigurationStore {
     public func load(_ url: URL) throws -> FileSnapshot {
         let logical = url.standardizedFileURL
         let resolved = Self.resolved(logical)
-        let data = try files.read(resolved)
+        let data: Data?
+        do { data = try files.read(resolved, maximumByteCount: KubeDocument.maximumByteCount) }
+        catch let error as POSIXError where error.code == .EFBIG {
+            throw ConfigError.invalid("Configuration exceeds the 16 MB size limit.")
+        }
         if let data, String(data: data, encoding: .utf8) == nil { throw ConfigError.invalid("The configuration must be UTF-8 text.") }
         return FileSnapshot(url: logical, resolvedURL: resolved, data: data)
     }
 
     public func hasChanged(_ snapshot: FileSnapshot) throws -> Bool {
         if Self.resolved(snapshot.url) != snapshot.resolvedURL { return true }
-        return try files.read(snapshot.resolvedURL) != snapshot.data
+        return try !files.matches(snapshot.data, at: snapshot.resolvedURL)
     }
 
     /// `resolvingSymlinksInPath` stops at a dangling link, and writing there would replace the link.
