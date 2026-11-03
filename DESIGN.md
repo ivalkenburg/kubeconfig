@@ -18,6 +18,8 @@ components:
     padding: "6pt 10pt"
   notice-bar:
     padding: "{spacing.notice}"
+  k9s-terminal:
+    padding: "{spacing.related}"
   detail-header:
     padding: "14pt 24pt"
 ---
@@ -134,12 +136,12 @@ The title has one explanatory line, followed directly by the column heading with
 
 ### k9s Terminal
 
-A SwiftTerm view replaces the entry form with no header, since k9s shows its live context itself. While it is on screen, Expand and Close form their own group before the other toolbar buttons, and Restart is in the View menu and the failure notices. It is a code surface, so it stays solid. It is the one fixed-color surface in the app: k9s skins assume a dark terminal, so it stays dark in both appearances, in SF Mono at 12 points. Don't add a theme setting, since k9s skins own those colors.
+A SwiftTerm view replaces the entry form with no header, since k9s shows its live context itself. While it is on screen, Expand and Close form their own group before the other toolbar buttons, and Restart is in the View menu and the failure notices. It is a code surface, so it stays solid. It uses SF Mono at 12 points and an 8-point inset inside the terminal host, with a solid background following SwiftTerm’s actual backing-layer color. k9s paints its skin as true-color cells rather than changing the terminal default, so output updates align the canvas with a background occupying more than half the screen. Selection rows, borders, and status colors do not override it. Runtime default-background changes and reverse video remain supported. Each context retains its own session and expanded layout. New and restarted sessions use the system appearance at launch: light mode passes `--invert` to k9s, while terminal foreground and background use semantic AppKit text colors resolved for that appearance. The session keeps its launch appearance when the system appearance changes; terminal programs can still change their colors. Don't add a theme setting or modify k9s configuration, since k9s skins own their colors.
 
 ## Do's and Don'ts
 
 ### Do:
-- Do use semantic SwiftUI/AppKit colors and verify both macOS appearances. The k9s terminal is the one exception.
+- Do use semantic SwiftUI/AppKit colors and verify both macOS appearances. k9s sessions retain their launch appearance until restarted.
 - Do preserve native focus, keyboard shortcuts, disabled states, and accessible action labels.
 - Do keep search available for contexts, clusters, users, and backups, including clear-search and empty-result states.
 - Do pair warnings and diff colors with symbols, text, or change prefixes.

@@ -215,7 +215,7 @@ struct MainView: View {
     }
 
     private func k9sStatus(_ entry: ConfigEntry) -> String? {
-        guard entry.kind == .contexts, let session = model.k9sSession, session.contextName == entry.name else { return nil }
+        guard entry.kind == .contexts, let session = model.k9sSessions[entry.name] else { return nil }
         return session.phase == .running ? "k9s is running" : "k9s stopped"
     }
 

@@ -42,7 +42,7 @@ private struct DraftStep {
     var context: String?
 }
 
-/// The running k9s. Only one exists at a time, and it keeps running while other entries are on screen.
+/// One context's k9s, which keeps running while other entries are on screen.
 struct K9sSession {
     enum Phase: Equatable {
         case running
@@ -57,8 +57,10 @@ struct K9sSession {
     let terminal: K9sTerminal
     /// The file as k9s first read it, which later versions are compared with.
     let baseline: KubeDocument?
+    let appearance: K9sAppearance
     var phase = Phase.running
     var freshness = ContextConnectionChange.unchanged
+    var isExpanded = false
 }
 
 struct EntryEditor: Equatable {
@@ -143,9 +145,13 @@ final class AppModel: ObservableObject {
     @Published var showImportSource = false
     @Published private(set) var contextExportPlan: ContextExportPlan?
     @Published var wrapsYAML: Bool { didSet { defaults.set(wrapsYAML, forKey: Self.wrapsYAMLKey) } }
-    @Published private(set) var k9sSession: K9sSession?
-    /// Hides the sidebar and list for k9s, without touching the sidebar preference.
-    @Published var k9sIsExpanded = false
+    @Published private(set) var k9sSessions: [String: K9sSession] = [:]
+    var k9sSession: K9sSession? { selectedName.flatMap { k9sSessions[$0] } }
+    /// Each session remembers its layout without touching the sidebar preference.
+    var k9sIsExpanded: Bool {
+        get { k9sSession?.isExpanded ?? false }
+        set { if let name = k9sSession?.contextName { k9sSessions[name]?.isExpanded = newValue } }
+    }
     @Published private var undoStack: [DraftStep] = []
     @Published private var redoStack: [DraftStep] = []
     @Published var rawCanUndo = false
@@ -173,10 +179,14 @@ final class AppModel: ObservableObject {
     var findLoginPath: () async -> String? = { await LoginShell.path() }
     var isK9sExecutable: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)
     var k9sEnvironment = ProcessInfo.processInfo.environment
-    private(set) var k9sLaunchTask: Task<Void, Never>?
+    var k9sAppearance: () -> K9sAppearance = {
+        NSApplication.shared.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
+    }
+    private var k9sLaunchTasks: [String: Task<Void, Never>] = [:]
+    var k9sLaunchTask: Task<Void, Never>? { selectedName.flatMap { k9sLaunchTasks[$0] } }
     /// Kept for the run, since each lookup starts the user's shell. Try Again looks again.
     private var k9sLoginPath: String?
-    private var k9sWantsFocus = false
+    private var k9sFocusRequests: Set<UUID> = []
 
     init(store: ConfigurationStore = ConfigurationStore(), defaults: UserDefaults = .standard, initialURL: URL? = nil,
          arguments: [String] = ProcessInfo.processInfo.arguments) {
@@ -316,8 +326,8 @@ final class AppModel: ObservableObject {
     func load(_ url: URL) {
         reportingErrors {
             let loaded = try store.load(url)
-            if k9sSession?.resolvedFileURL != loaded.resolvedURL { closeK9s() }
-            let keepsK9sOnScreen = k9sIsVisible
+            if k9sSessions.values.contains(where: { $0.resolvedFileURL != loaded.resolvedURL }) { closeAllK9s() }
+            let visibleK9sContext = k9sIsVisible ? k9sSession?.contextName : nil
             snapshot = loaded
             if loaded.exists { noteRecentFile(loaded.url) }
             draftText = loaded.text
@@ -327,8 +337,8 @@ final class AppModel: ObservableObject {
             clearHistory()
             selectFirstEntry()
             refreshBackups()
-            closeK9sIfContextIsGone()
-            if keepsK9sOnScreen, let name = k9sSession?.contextName { selectEntry(name) }
+            closeK9sForRemovedContexts()
+            if let name = visibleK9sContext, k9sSessions[name] != nil { selectEntry(name) }
         }
     }
 
@@ -658,75 +668,84 @@ final class AppModel: ObservableObject {
         guard let name = requested ?? selectedName, k9sBlockReason(name) == nil else { return }
         if selectedName != name || selectedContextNames != [name] { selectEntry(name) }
         guard selectedName == name, let snapshot else { return }
-        if let k9sSession, k9sSession.contextName == name {
-            let view = k9sSession.terminal.view
-            if let window = view.window { window.makeFirstResponder(view) } else { k9sWantsFocus = true }
+        if let session = k9sSessions[name] {
+            let view = session.terminal.view
+            if let window = view.window { window.makeFirstResponder(view) } else { k9sFocusRequests.insert(session.id) }
         } else {
-            closeK9s()
             startK9s(context: name, snapshot: snapshot)
         }
     }
 
     func restartK9s() {
-        guard let k9sSession, k9sRestartBlockReason == nil, let snapshot else { return }
-        if k9sSession.phase == .missing { k9sLoginPath = nil }
-        endK9s()
-        startK9s(context: k9sSession.contextName, snapshot: snapshot)
+        guard let session = k9sSession, k9sRestartBlockReason == nil, let snapshot else { return }
+        if session.phase == .missing { k9sLoginPath = nil }
+        endK9s(context: session.contextName)
+        startK9s(context: session.contextName, snapshot: snapshot, isExpanded: session.isExpanded)
     }
 
     func closeK9s() {
-        endK9s()
-        k9sIsExpanded = false
+        guard let name = k9sSession?.contextName else { return }
+        endK9s(context: name)
     }
 
-    private func endK9s() {
-        if let terminal = k9sSession?.terminal {
-            terminal.onExit = nil
-            terminal.stop()
+    func closeAllK9s() {
+        for name in Array(k9sSessions.keys) { endK9s(context: name) }
+    }
+
+    private func endK9s(context name: String) {
+        k9sLaunchTasks.removeValue(forKey: name)?.cancel()
+        // Remove ownership first, so a late callback cannot change a replacement session.
+        if let session = k9sSessions.removeValue(forKey: name) {
+            k9sFocusRequests.remove(session.id)
+            session.terminal.onExit = nil
+            session.terminal.stop()
         }
-        k9sSession = nil
     }
 
-    /// Selection moves on from a context that's gone, so nothing would show the session or let it be closed.
-    /// A file that needs repair says nothing about the context, unlike one that's missing or blank.
-    private func closeK9sIfContextIsGone() {
-        guard let k9sSession, parseIssue == nil, document?.entry(.contexts, named: k9sSession.contextName) == nil else { return }
-        closeK9s()
+    /// Selection moves on from contexts that are gone, leaving no way to close their sessions.
+    /// A file that needs repair says nothing about the contexts, unlike one that's missing or blank.
+    private func closeK9sForRemovedContexts() {
+        guard parseIssue == nil else { return }
+        for name in Array(k9sSessions.keys) where document?.entry(.contexts, named: name) == nil {
+            endK9s(context: name)
+        }
     }
 
-    /// Whether the terminal should take focus when it next appears. Only asked-for k9s does.
-    func takeK9sFocusRequest() -> Bool {
-        defer { k9sWantsFocus = false }
-        return k9sWantsFocus
+    /// Only an explicit Open request takes focus, and only in the pane for that session.
+    func takeK9sFocusRequest(for id: UUID? = nil) -> Bool {
+        guard k9sIsVisible, let session = k9sSession, id == nil || session.id == id else { return false }
+        return k9sFocusRequests.remove(session.id) != nil
     }
 
-    private func startK9s(context name: String, snapshot: FileSnapshot) {
+    private func startK9s(context name: String, snapshot: FileSnapshot, isExpanded: Bool = false) {
         let terminal = makeK9sTerminal()
         let baseline = latestDisk(changed: fileHasChanged).document
         let kubeconfig = snapshot.url
         let cluster = baseline?.entry(.contexts, named: name)?.value("cluster") ?? ""
-        let session = K9sSession(contextName: name, resolvedFileURL: snapshot.resolvedURL, terminal: terminal, baseline: baseline)
+        let appearance = k9sAppearance()
+        let session = K9sSession(contextName: name, resolvedFileURL: snapshot.resolvedURL, terminal: terminal,
+                                 baseline: baseline, appearance: appearance, isExpanded: isExpanded)
         let id = session.id
-        k9sSession = session
-        k9sWantsFocus = true
-        terminal.onExit = { [weak self] code in self?.k9sExited(id, code: code) }
-        k9sLaunchTask = Task { [weak self, findLoginPath, isK9sExecutable, k9sEnvironment, k9sLoginPath] in
+        k9sSessions[name] = session
+        k9sFocusRequests.insert(id)
+        terminal.onExit = { [weak self] code in self?.k9sExited(context: name, id: id, code: code) }
+        k9sLaunchTasks[name] = Task { [weak self, findLoginPath, isK9sExecutable, k9sEnvironment, k9sLoginPath] in
             let loginPath: String?
             if let k9sLoginPath { loginPath = k9sLoginPath } else { loginPath = await findLoginPath() }
-            guard let self else { return }
+            guard let self, !Task.isCancelled, self.k9sSessions[name]?.id == id else { return }
             self.k9sLoginPath = loginPath
-            guard self.k9sSession?.id == id else { return }
-            if let launch = K9sLaunch(kubeconfig: kubeconfig, context: name, cluster: cluster, loginPath: loginPath, inherited: k9sEnvironment, isExecutable: isK9sExecutable) {
+            if let launch = K9sLaunch(kubeconfig: kubeconfig, context: name, cluster: cluster, appearance: appearance,
+                                      loginPath: loginPath, inherited: k9sEnvironment, isExecutable: isK9sExecutable) {
                 terminal.start(launch)
             } else {
-                self.k9sSession?.phase = .missing
+                self.k9sSessions[name]?.phase = .missing
             }
         }
     }
 
-    private func k9sExited(_ id: UUID, code: Int32?) {
-        guard k9sSession?.id == id else { return }
-        if code == 0 { closeK9s() } else { k9sSession?.phase = .exited(code) }
+    private func k9sExited(context name: String, id: UUID, code: Int32?) {
+        guard k9sSessions[name]?.id == id else { return }
+        if code == 0 { endK9s(context: name) } else { k9sSessions[name]?.phase = .exited(code) }
     }
 
     private var fileHasChanged: Bool { snapshot.map { (try? store.hasChanged($0)) ?? true } ?? false }
@@ -740,9 +759,18 @@ final class AppModel: ObservableObject {
 
     /// A file that can't be read says nothing about the context, so that only counts as a change.
     private func refreshK9sFreshness(disk: KubeDocument?, fileIsGone: Bool) {
-        guard let k9sSession else { return }
-        guard disk != nil || fileIsGone else { self.k9sSession?.freshness = .changed; return }
-        self.k9sSession?.freshness = KubeDocument.connectionChange(ofContext: k9sSession.contextName, from: k9sSession.baseline, to: disk)
+        var updated = k9sSessions
+        var didChange = false
+        for (name, session) in k9sSessions {
+            let freshness: ContextConnectionChange = disk != nil || fileIsGone
+                ? KubeDocument.connectionChange(ofContext: name, from: session.baseline, to: disk)
+                : .changed
+            if freshness != session.freshness {
+                updated[name]?.freshness = freshness
+                didChange = true
+            }
+        }
+        if didChange { k9sSessions = updated }
     }
 
     /// Shows an alert and returns the index of the chosen button.
@@ -815,7 +843,7 @@ final class AppModel: ObservableObject {
             showReview = false
             clearHistory()
             refreshBackups()
-            closeK9sIfContextIsGone()
+            closeK9sForRemovedContexts()
             let action = afterApply; afterApply = nil
             // Keep the recovery export available if writing the backup failed.
             if result.warning == nil { action?() }
@@ -899,7 +927,7 @@ final class AppModel: ObservableObject {
         guard snapshot != nil else { return }
         let changed = fileHasChanged
         fileChangedOnDisk = changed
-        if k9sSession != nil {
+        if !k9sSessions.isEmpty {
             let disk = latestDisk(changed: changed)
             refreshK9sFreshness(disk: disk.document, fileIsGone: disk.isGone)
         }

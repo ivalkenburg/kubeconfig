@@ -90,7 +90,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         model.resolvePendingChanges { DispatchQueue.main.async { sender.terminate(nil) } }
         return .terminateCancel
     }
-    func applicationWillTerminate(_ notification: Notification) { model?.closeK9s() }
+    func applicationWillTerminate(_ notification: Notification) { model?.closeAllK9s() }
 }
 
 private struct WindowBridge: NSViewRepresentable {

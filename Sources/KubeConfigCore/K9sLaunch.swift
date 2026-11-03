@@ -1,11 +1,16 @@
 import Foundation
 import Yams
 
+public enum K9sAppearance: Sendable {
+    case light, dark
+}
+
 /// How to start k9s on one context of a file, without it depending on the active context.
 public struct K9sLaunch {
     public let executable: String
     public let arguments: [String]
     public let environment: [String]
+    public let appearance: K9sAppearance
 
     /// Where package managers install k9s, for when the login shell can't be asked.
     static let fallbackDirectories = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/run/current-system/sw/bin"]
@@ -24,15 +29,17 @@ public struct K9sLaunch {
     /// Returns nil when k9s can't be found. Apps opened from Finder don't inherit the shell's `PATH`, so `loginPath`
     /// goes first and also reaches k9s itself, which needs it to find credential plugins.
     /// `cluster` is the one the context points to, which k9s uses to find what it saved for the context.
-    public init?(kubeconfig: URL, context: String, cluster: String = "", loginPath: String?, inherited: [String: String],
+    public init?(kubeconfig: URL, context: String, cluster: String = "", appearance: K9sAppearance = .dark, loginPath: String?, inherited: [String: String],
                  isExecutable: (String) -> Bool = FileManager.default.isExecutableFile(atPath:)) {
         var directories: [String] = []
         for directory in [loginPath, inherited["PATH"]].compactMap({ $0 }).flatMap({ $0.components(separatedBy: ":") }) + Self.fallbackDirectories
         where !directory.isEmpty && !directories.contains(directory) { directories.append(directory) }
         guard let executable = directories.map({ ($0 as NSString).appendingPathComponent("k9s") }).first(where: isExecutable) else { return nil }
         self.executable = executable
+        self.appearance = appearance
         let startingView = K9sSavedView.isContextList(cluster: cluster, context: context, environment: inherited) ? ["--command", "pods"] : []
-        arguments = ["--kubeconfig", kubeconfig.path, "--context", context, "--splashless", "--logoless"] + startingView
+        arguments = ["--kubeconfig", kubeconfig.path, "--context", context, "--splashless", "--logoless"]
+            + (appearance == .light ? ["--invert"] : []) + startingView
         var variables = inherited
         variables["PATH"] = directories.joined(separator: ":")
         variables["KUBECONFIG"] = kubeconfig.path

@@ -20,6 +20,15 @@ final class K9sLaunchTests: XCTestCase {
         XCTAssertTrue(path.hasPrefix("PATH=/first:/both:/usr/bin:/opt/homebrew/bin"))
     }
 
+    func testOnlyLightAppearanceInvertsTheSelectedSkin() throws {
+        for appearance in [K9sAppearance.light, .dark] {
+            let launch = try XCTUnwrap(K9sLaunch(kubeconfig: config, context: "c", appearance: appearance,
+                                               loginPath: "/bin", inherited: [:]) { _ in true })
+            XCTAssertEqual(launch.arguments.contains("--invert"), appearance == .light)
+            XCTAssertEqual(launch.appearance, appearance)
+        }
+    }
+
     func testFallsBackToPackageManagerFolders() throws {
         let launch = K9sLaunch(kubeconfig: config, context: "c", loginPath: nil, inherited: [:]) { $0 == "/opt/homebrew/bin/k9s" }
         XCTAssertEqual(launch?.executable, "/opt/homebrew/bin/k9s")

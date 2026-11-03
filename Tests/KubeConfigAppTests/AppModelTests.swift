@@ -1,6 +1,7 @@
 import XCTest
 import KubeConfigCore
 import SwiftUI
+import SwiftTerm
 @testable import KubeConfig
 
 final class AppModelTests: XCTestCase {
@@ -2483,6 +2484,8 @@ extension AppModelTests {
             model.findLoginPath = { "/fake/bin" }
             model.isK9sExecutable = { k9sInstalled && $0 == "/fake/bin/k9s" }
             model.k9sEnvironment = ["K9S_CONFIG_DIR": url.deletingLastPathComponent().appendingPathComponent("k9s").path]
+            model.k9sAppearance = { .dark }
+            defer { model.closeAllK9s() }
             try await body(model, url, terminals)
         }
     }
@@ -2542,15 +2545,233 @@ extension AppModelTests {
         }
     }
 
-    func testOpeningAnotherContextReplacesTheSession() async throws {
+    func testOpeningAnotherContextKeepsBothSessions() async throws {
         try await withK9s { model, _, terminals in
             await self.open(model, "dev")
             let first = terminals.all[0], exit = first.onExit
             await self.open(model, "other")
-            XCTAssertTrue(first.stopped)
+            XCTAssertFalse(first.stopped)
+            XCTAssertEqual(model.k9sSessions.count, 2)
             XCTAssertEqual(model.k9sSession?.contextName, "other")
             exit?(1)
             XCTAssertEqual(model.k9sSession?.phase, .running)
+            XCTAssertEqual(model.k9sSessions["dev"]?.phase, .exited(1))
+            model.selectEntry("dev")
+            XCTAssertEqual(model.k9sSession?.terminal.view, first.view)
+            XCTAssertEqual(model.k9sSession?.phase, .exited(1))
+            await self.open(model, "dev")
+            XCTAssertEqual(terminals.all.count, 2, "Opening an existing session focuses it")
+        }
+    }
+
+    func testCloseAndRestartOnlyAffectTheSelectedSession() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            model.k9sIsExpanded = true
+            let devID = model.k9sSession?.id
+            await self.open(model, "other")
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertTrue(terminals.all[1].stopped)
+            XCTAssertFalse(terminals.all[0].stopped)
+            XCTAssertEqual(model.k9sSessions["dev"]?.id, devID)
+            model.closeK9s()
+            XCTAssertTrue(terminals.all[2].stopped)
+            XCTAssertEqual(Set(model.k9sSessions.keys), ["dev"])
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sFillsWindow)
+        }
+    }
+
+    func testBackgroundCleanExitAndLateCallbacksLeaveOtherSessionsAlone() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            let oldExit = terminals.all[0].onExit
+            await self.open(model, "other")
+            model.k9sIsExpanded = true
+            oldExit?(0)
+            XCTAssertNil(model.k9sSessions["dev"])
+            XCTAssertEqual(model.k9sSession?.contextName, "other")
+            XCTAssertTrue(model.k9sFillsWindow)
+            XCTAssertFalse(terminals.all[1].stopped)
+            await self.open(model, "dev")
+            oldExit?(1)
+            oldExit?(0)
+            XCTAssertEqual(model.k9sSessions["dev"]?.phase, .running)
+            XCTAssertEqual(model.k9sSessions.count, 2)
+        }
+    }
+
+    func testClosingOnePendingLaunchKeepsTheOtherLaunch() async throws {
+        try await withK9s { model, _, terminals in
+            let gate = LaunchGate()
+            model.findLoginPath = { await gate.wait(); return "/fake/bin" }
+            model.openK9s("dev")
+            let first = model.k9sLaunchTask
+            model.openK9s("other")
+            let second = model.k9sLaunchTask
+            model.selectEntry("dev")
+            model.closeK9s()
+            gate.open()
+            await first?.value
+            await second?.value
+            XCTAssertNil(terminals.all[0].launch)
+            XCTAssertTrue(terminals.all[0].stopped)
+            XCTAssertNotNil(terminals.all[1].launch)
+            XCTAssertFalse(terminals.all[1].stopped)
+        }
+    }
+
+    func testReloadAndFileChangeHandleAllSessions() async throws {
+        try await withK9s { model, url, terminals in
+            await self.open(model, "dev")
+            await self.open(model, "other")
+            model.load(url)
+            XCTAssertEqual(model.k9sSessions.count, 2)
+            XCTAssertEqual(model.selectedName, "other")
+            XCTAssertTrue(terminals.all.allSatisfy { !$0.stopped })
+            try Self.fixture.replacingOccurrences(of: "name: other", with: "name: renamed")
+                .write(to: url, atomically: true, encoding: .utf8)
+            model.load(url)
+            XCTAssertEqual(Set(model.k9sSessions.keys), ["dev"])
+            XCTAssertTrue(terminals.all[1].stopped)
+            XCTAssertFalse(terminals.all[0].stopped)
+            await self.open(model, "renamed")
+            let otherFile = url.deletingLastPathComponent().appendingPathComponent("second")
+            try Self.fixture.write(to: otherFile, atomically: true, encoding: .utf8)
+            model.load(otherFile)
+            XCTAssertTrue(model.k9sSessions.isEmpty)
+            XCTAssertTrue(terminals.all.allSatisfy(\.stopped))
+        }
+    }
+
+    func testApplyingDeletionClosesOnlyTheRemovedContextsSession() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            await self.open(model, "other")
+            model.deleteEntry("other")
+            model.commit()
+            XCTAssertEqual(Set(model.k9sSessions.keys), ["dev"])
+            XCTAssertTrue(terminals.all[1].stopped)
+            XCTAssertFalse(terminals.all[0].stopped)
+        }
+    }
+
+    func testFreshnessIsTrackedForEverySession() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            await self.open(model, "other")
+            try Self.fixture.replacingOccurrences(of: "namespace: default", with: "namespace: changed")
+                .write(to: url, atomically: true, encoding: .utf8)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSessions["dev"]?.freshness, .changed)
+            XCTAssertEqual(model.k9sSessions["other"]?.freshness, .unchanged)
+        }
+    }
+
+    func testHiddenSessionsNoticeExternalChangesWithoutASelectedTerminal() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            model.selectEntry("other")
+            XCTAssertNil(model.k9sSession)
+            try Self.fixture.replacingOccurrences(of: "namespace: default", with: "namespace: changed")
+                .write(to: url, atomically: true, encoding: .utf8)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSessions["dev"]?.freshness, .changed)
+
+            model.selectSection(.backups)
+            try Self.fixture.replacingOccurrences(of: "name: dev\n  context", with: "name: renamed\n  context")
+                .write(to: url, atomically: true, encoding: .utf8)
+            model.checkForExternalChange()
+            XCTAssertEqual(model.k9sSessions["dev"]?.freshness, .removed)
+            model.selectSection(.contexts)
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sIsVisible)
+            XCTAssertEqual(model.k9sSession?.freshness, .removed)
+        }
+    }
+
+    func testSessionFreshnessPublishesOnlyOneUpdateWhenValuesChange() async throws {
+        try await withK9s { model, url, _ in
+            await self.open(model, "dev")
+            await self.open(model, "other")
+            var updates = 0
+            let subscription = model.$k9sSessions.dropFirst().sink { _ in updates += 1 }
+            defer { subscription.cancel() }
+
+            model.checkForExternalChange()
+            XCTAssertEqual(updates, 0, "Unchanged sessions need no publication")
+            try Self.fixture.replacingOccurrences(of: "https://dev.invalid", with: "https://changed.invalid")
+                .write(to: url, atomically: true, encoding: .utf8)
+            model.checkForExternalChange()
+            XCTAssertEqual(updates, 1, "Both sessions share the changed cluster and publish together")
+            XCTAssertTrue(model.k9sSessions.values.allSatisfy { $0.freshness == .changed })
+
+            model.checkForExternalChange()
+            XCTAssertEqual(updates, 1, "A repeated check leaves existing warnings alone")
+            try Self.fixture.write(to: url, atomically: true, encoding: .utf8)
+            model.checkForExternalChange()
+            XCTAssertEqual(updates, 2)
+            XCTAssertTrue(model.k9sSessions.values.allSatisfy { $0.freshness == .unchanged })
+        }
+    }
+
+    func testQuittingClosesAllSessionsIncludingAPendingLaunch() async throws {
+        try await withK9s { model, _, terminals in
+            await self.open(model, "dev")
+            let gate = LaunchGate()
+            model.findLoginPath = { await gate.wait(); return "/fake/bin" }
+            // A missing executable makes Try Again refresh the cached login PATH.
+            model.isK9sExecutable = { _ in false }
+            await self.open(model, "other")
+            model.restartK9s()
+            let pending = model.k9sLaunchTask
+            let delegate = ApplicationDelegate()
+            delegate.model = model
+            delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+            gate.open()
+            await pending?.value
+            XCTAssertTrue(model.k9sSessions.isEmpty)
+            XCTAssertTrue(terminals.all.allSatisfy(\.stopped))
+            XCTAssertNil(terminals.all.last?.launch)
+        }
+    }
+
+    func testSessionsUseLaunchAppearanceUntilRestarted() async throws {
+        try await withK9s { model, _, terminals in
+            var appearance = K9sAppearance.light
+            model.k9sAppearance = { appearance }
+            await self.open(model, "dev")
+            let firstID = model.k9sSession?.id
+            appearance = .dark
+            await self.open(model, "other")
+            XCTAssertEqual(terminals.all[0].launch?.appearance, .light)
+            XCTAssertTrue(terminals.all[0].launch?.arguments.contains("--invert") == true)
+            XCTAssertEqual(terminals.all[1].launch?.appearance, .dark)
+            XCTAssertFalse(terminals.all[1].launch?.arguments.contains("--invert") == true)
+            await self.open(model, "dev")
+            XCTAssertEqual(model.k9sSession?.id, firstID)
+            XCTAssertEqual(model.k9sSession?.appearance, .light)
+            XCTAssertFalse(terminals.all[0].stopped)
+            model.restartK9s()
+            await model.k9sLaunchTask?.value
+            XCTAssertEqual(model.k9sSession?.appearance, .dark)
+            XCTAssertFalse(terminals.all[2].launch?.arguments.contains("--invert") == true)
+            XCTAssertFalse(terminals.all[1].stopped)
+        }
+    }
+
+    func testFocusRequestsBelongToTheirSession() async throws {
+        try await withK9s { model, _, _ in
+            await self.open(model, "dev")
+            let devID = try XCTUnwrap(model.k9sSession?.id)
+            await self.open(model, "other")
+            let otherID = try XCTUnwrap(model.k9sSession?.id)
+            XCTAssertFalse(model.takeK9sFocusRequest(for: devID))
+            XCTAssertTrue(model.takeK9sFocusRequest(for: otherID))
+            model.selectEntry("dev")
+            XCTAssertTrue(model.takeK9sFocusRequest(for: devID))
+            XCTAssertFalse(model.takeK9sFocusRequest(for: devID))
         }
     }
 
@@ -2637,7 +2858,7 @@ extension AppModelTests {
 
             try Data(Self.fixture.replacingOccurrences(of: "https://dev.invalid", with: "https://new.invalid").utf8).write(to: url)
             model.checkForExternalChange()
-            XCTAssertEqual(model.k9sSession?.freshness, .changed)
+            XCTAssertEqual(model.k9sSessions["dev"]?.freshness, .changed)
 
             model.restartK9s()
             await model.k9sLaunchTask?.value
@@ -2658,7 +2879,7 @@ extension AppModelTests {
             model.editor?.fields["server"] = "https://new.invalid"
             model.commitForm()
             model.commit()
-            XCTAssertEqual(model.k9sSession?.freshness, .changed)
+            XCTAssertEqual(model.k9sSessions["dev"]?.freshness, .changed)
         }
     }
 
@@ -2722,7 +2943,7 @@ extension AppModelTests {
         }
     }
 
-    func testReplacingDuringLaunchStartsOnlyTheNewContext() async throws {
+    func testOpeningAnotherContextDuringLaunchStartsBoth() async throws {
         try await withK9s { model, _, terminals in
             let gate = LaunchGate()
             model.findLoginPath = { await gate.wait(); return "/fake/bin" }
@@ -2733,7 +2954,7 @@ extension AppModelTests {
             gate.open()
             await first?.value
             await second?.value
-            XCTAssertNil(terminals.all[0].launch)
+            XCTAssertEqual(terminals.all[0].launch?.arguments.dropFirst(3).first, "dev")
             XCTAssertEqual(terminals.all[1].launch?.arguments.dropFirst(3).first, "other")
         }
     }
@@ -2880,7 +3101,7 @@ extension AppModelTests {
             let broken = url.deletingLastPathComponent().appendingPathComponent("broken")
             try Data([0xFF, 0xFE, 0xFD]).write(to: broken)
             model.load(broken)
-            XCTAssertNotNil(model.k9sSession)
+            XCTAssertNotNil(model.k9sSessions["dev"])
             XCTAssertFalse(terminals.all[0].stopped)
         }
     }
@@ -2952,7 +3173,7 @@ extension AppModelTests {
             await self.open(model, "dev")
             try "clusters: [".write(to: url, atomically: true, encoding: .utf8)
             model.reload()
-            XCTAssertNotNil(model.k9sSession)
+            XCTAssertNotNil(model.k9sSessions["dev"])
         }
     }
 
@@ -3027,7 +3248,144 @@ extension AppModelTests {
         XCTAssertEqual(status.value, 3)
     }
 
-    func testReplacingCollapsesAndRestartKeepsExpand() async throws {
+    @MainActor func testTerminalInsetsAndLaunchColorsSurviveResizeAndAppearanceChanges() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("k9s")
+        try "#!/bin/sh\nprintf 'Context: development\\r\\n\\r\\nNAME          READY   STATUS\\r\\napi-server    1/1     Running\\r\\n'\nexit 3\n"
+            .write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        for appearance in [K9sAppearance.light, .dark] {
+            let launch = try XCTUnwrap(K9sLaunch(kubeconfig: directory.appendingPathComponent("config"), context: "c",
+                                               appearance: appearance, loginPath: directory.path, inherited: [:]))
+            let terminal = K9sTerminalProcess()
+            defer { terminal.stop() }
+            let window = try await render(K9sTerminalHost(terminal: terminal.view, appearance: appearance, takeFocusRequest: { false }))
+            defer { window.orderOut(nil) }
+            let exited = expectation(description: "terminal output in \(appearance)")
+            terminal.onExit = { _ in exited.fulfill() }
+            terminal.start(launch)
+            await fulfillment(of: [exited], timeout: 10)
+            window.appearance = (appearance == .light ? K9sAppearance.dark : .light).nativeAppearance
+
+            for size in [NSSize(width: 800, height: 600), NSSize(width: 480, height: 320)] {
+                window.setContentSize(size)
+                window.contentView?.layoutSubtreeIfNeeded()
+                let container = try XCTUnwrap(terminal.view.superview as? K9sTerminalHost.Container)
+                XCTAssertEqual(terminal.view.frame, container.bounds.insetBy(dx: 8, dy: 8))
+                XCTAssertEqual(terminal.view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]),
+                               appearance == .light ? .aqua : .darkAqua)
+                XCTAssertEqual(container.layer?.backgroundColor, terminal.view.layer?.backgroundColor)
+                let terminalBackground = try XCTUnwrap(terminal.view.layer?.backgroundColor)
+                let color = try XCTUnwrap(NSColor(cgColor: terminalBackground)?.usingColorSpace(.deviceRGB))
+                XCTAssertEqual(color.redComponent, appearance.backgroundColor.redComponent, accuracy: 0.001)
+                XCTAssertEqual(color.greenComponent, appearance.backgroundColor.greenComponent, accuracy: 0.001)
+                XCTAssertEqual(color.blueComponent, appearance.backgroundColor.blueComponent, accuracy: 0.001)
+            }
+        }
+    }
+
+    @MainActor func testTerminalPaddingFollowsRuntimeBackgroundChangesAndReparenting() async throws {
+        let terminal = K9sTerminalProcess()
+        let view = try XCTUnwrap(terminal.view as? TerminalView)
+        let host = K9sTerminalHost(terminal: view, appearance: .dark, takeFocusRequest: { false })
+        let firstWindow = try await render(host)
+        defer { firstWindow.orderOut(nil) }
+        let firstContainer = try XCTUnwrap(view.superview as? K9sTerminalHost.Container)
+
+        @MainActor func changeBackground(to color: NSColor, using sequence: String, in container: K9sTerminalHost.Container) async throws {
+            let changed = expectation(description: "padding follows terminal background")
+            let layer = try XCTUnwrap(container.layer)
+            let expected = try XCTUnwrap(color.usingColorSpace(.sRGB))
+            let observation = layer.observe(\.backgroundColor, options: [.new]) { layer, _ in
+                guard let background = layer.backgroundColor,
+                      let actual = NSColor(cgColor: background)?.usingColorSpace(.sRGB),
+                      abs(actual.redComponent - expected.redComponent) < 0.001,
+                      abs(actual.greenComponent - expected.greenComponent) < 0.001,
+                      abs(actual.blueComponent - expected.blueComponent) < 0.001 else { return }
+                changed.fulfill()
+            }
+            defer { observation.invalidate() }
+            view.feed(text: sequence)
+            await fulfillment(of: [changed], timeout: 5)
+            XCTAssertEqual(container.layer?.backgroundColor, view.layer?.backgroundColor)
+        }
+
+        // OSC 11 is how a terminal program changes its default background.
+        try await changeBackground(to: NSColor(srgbRed: 0x22 / 255.0, green: 0x44 / 255.0, blue: 0x66 / 255.0, alpha: 1),
+                                   using: "\u{1b}]11;rgb:22/44/66\u{7}", in: firstContainer)
+        let firstBackground = firstContainer.layer?.backgroundColor
+
+        // A SwiftUI update must not reset the program's color to the launch appearance.
+        (firstWindow.contentView as? NSHostingView<K9sTerminalHost>)?.rootView = host
+        firstWindow.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(firstContainer.layer?.backgroundColor, firstBackground)
+
+        let secondWindow = try await render(host)
+        defer { secondWindow.orderOut(nil) }
+        let secondContainer = try XCTUnwrap(view.superview as? K9sTerminalHost.Container)
+        XCTAssertEqual(secondContainer.layer?.backgroundColor, firstBackground)
+        try await changeBackground(to: NSColor(srgbRed: 0x66 / 255.0, green: 0x44 / 255.0, blue: 0x22 / 255.0, alpha: 1),
+                                   using: "\u{1b}]11;rgb:66/44/22\u{7}", in: secondContainer)
+        try await changeBackground(to: view.nativeForegroundColor, using: "\u{1b}[?5h", in: secondContainer)
+        try await changeBackground(to: view.nativeBackgroundColor, using: "\u{1b}[?5l", in: secondContainer)
+        XCTAssertEqual(firstContainer.layer?.backgroundColor, firstBackground, "The old host stops observing after reparenting")
+        XCTAssertEqual(view.frame, secondContainer.bounds.insetBy(dx: 8, dy: 8))
+    }
+
+    @MainActor func testK9sCellFillsSetTheCanvasAndPaddingBackground() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let script = directory.appendingPathComponent("k9s")
+        // Like k9s/tcell: paint true-color cells, with a differently colored selection row, without OSC 11.
+        try """
+        #!/bin/sh
+        /bin/stty -echo
+        while IFS= read -r background; do
+            printf '\\033[48;2;%sm\\033[2J\\033[HContext: test' "$background"
+            printf '\\033[48;2;255;165;0m\\033[1;1H\\033[2KSelected row'
+        done
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let process = K9sTerminalProcess()
+        defer { process.stop() }
+        let terminal = try XCTUnwrap(process.view as? TerminalView)
+        let window = try await render(K9sTerminalHost(terminal: terminal, appearance: .dark, takeFocusRequest: { false }))
+        defer { window.orderOut(nil) }
+        let container = try XCTUnwrap(terminal.superview as? K9sTerminalHost.Container)
+        let launch = try XCTUnwrap(K9sLaunch(kubeconfig: directory.appendingPathComponent("config"), context: "test",
+                                           loginPath: directory.path, inherited: [:]))
+        process.start(launch)
+        let layer = try XCTUnwrap(container.layer)
+        // Test the reported black/gray mismatch, a custom skin, and a live switch to a light skin.
+        for rgb in [(0, 0, 0), (34, 68, 102), (238, 221, 204)] {
+            let matched = expectation(description: "padding matches the cell fill \(rgb)")
+            let expected = [CGFloat(rgb.0) / 255, CGFloat(rgb.1) / 255, CGFloat(rgb.2) / 255]
+            let observation = layer.observe(\.backgroundColor, options: [.new]) { layer, _ in
+                guard let background = layer.backgroundColor,
+                      let color = NSColor(cgColor: background)?.usingColorSpace(.sRGB),
+                      zip([color.redComponent, color.greenComponent, color.blueComponent], expected)
+                        .allSatisfy({ abs($0 - $1) < 0.001 }) else { return }
+                matched.fulfill()
+            }
+            terminal.send(txt: "\(rgb.0);\(rgb.1);\(rgb.2)\r")
+            await fulfillment(of: [matched], timeout: 5)
+            observation.invalidate()
+            let color = try XCTUnwrap(terminal.nativeBackgroundColor.usingColorSpace(.sRGB))
+            XCTAssertEqual(color.redComponent, expected[0], accuracy: 0.001)
+            XCTAssertEqual(color.greenComponent, expected[1], accuracy: 0.001)
+            XCTAssertEqual(color.blueComponent, expected[2], accuracy: 0.001)
+            XCTAssertEqual(container.layer?.backgroundColor, terminal.layer?.backgroundColor)
+            XCTAssertEqual(terminal.frame, container.bounds.insetBy(dx: 8, dy: 8))
+            XCTAssertEqual(terminal.terminalContentSnapshot(region: .viewport)?.rows.first?.cells.first?.attribute.bg,
+                           .trueColor(red: 255, green: 165, blue: 0), "A selection row must not recolor the surrounding canvas")
+        }
+    }
+
+    func testExpansionIsRememberedPerContextAndSurvivesRestart() async throws {
         try await withK9s { model, _, _ in
             await self.open(model, "dev")
             model.k9sIsExpanded = true
@@ -3036,6 +3394,13 @@ extension AppModelTests {
             XCTAssertTrue(model.k9sIsExpanded)
             await self.open(model, "other")
             XCTAssertFalse(model.k9sIsExpanded)
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sIsExpanded)
+            model.selectEntry("other")
+            model.k9sIsExpanded = true
+            model.closeK9s()
+            model.selectEntry("dev")
+            XCTAssertTrue(model.k9sIsExpanded, "Closing another session leaves this layout alone")
         }
     }
 

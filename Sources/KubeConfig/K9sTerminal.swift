@@ -3,6 +3,22 @@ import KubeConfigCore
 import SwiftTerm
 import SwiftUI
 
+extension K9sAppearance {
+    var nativeAppearance: NSAppearance { NSAppearance(named: self == .light ? .aqua : .darkAqua)! }
+
+    /// Resolve semantic colors once so running sessions keep their launch appearance.
+    var backgroundColor: NSColor { resolved(.textBackgroundColor) }
+    var foregroundColor: NSColor { resolved(.textColor) }
+
+    private func resolved(_ color: NSColor) -> NSColor {
+        var result = color
+        nativeAppearance.performAsCurrentDrawingAppearance {
+            result = color.usingColorSpace(.deviceRGB) ?? color
+        }
+        return result
+    }
+}
+
 /// A terminal running k9s. The model owns it, so it outlives the pane that shows it.
 @MainActor protocol K9sTerminal: AnyObject {
     var view: NSView { get }
@@ -14,23 +30,55 @@ import SwiftUI
 
 @MainActor final class K9sTerminalProcess: K9sTerminal, LocalProcessTerminalViewDelegate {
     private let terminal = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+    private let backgroundUpdates = DispatchSource.makeUserDataAddSource(queue: .main)
     var onExit: ((Int32?) -> Void)?
     var view: NSView { terminal }
 
     init() {
         terminal.processDelegate = self
         terminal.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        // k9s draws for a dark terminal, so this stays dark in Light Mode. DESIGN.md records the exception.
-        terminal.nativeBackgroundColor = NSColor(srgbRed: 0.08, green: 0.09, blue: 0.10, alpha: 1)
-        terminal.nativeForegroundColor = NSColor(srgbRed: 0.88, green: 0.89, blue: 0.90, alpha: 1)
+        backgroundUpdates.setEventHandler { [weak self] in self?.matchScreenBackground() }
+        backgroundUpdates.resume()
+        let updates = backgroundUpdates
+        terminal.setProcessOutputHandler { updates.add(data: 1) }
     }
 
+    deinit { backgroundUpdates.cancel() }
+
     func start(_ launch: K9sLaunch) {
+        terminal.appearance = launch.appearance.nativeAppearance
+        terminal.nativeBackgroundColor = launch.appearance.backgroundColor
+        terminal.nativeForegroundColor = launch.appearance.foregroundColor
         terminal.startProcess(executable: launch.executable, args: launch.arguments, environment: launch.environment,
                               currentDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 
     func stop() { terminal.terminate() }
+
+    /// k9s paints true-color cells with SGR instead of setting the default background with OSC 11.
+    /// Match a full-screen fill so the inset and partial final row/column share the skin's color.
+    private func matchScreenBackground() {
+        guard let snapshot = terminal.terminalContentSnapshot(region: .viewport) else { return }
+        var backgrounds: [Attribute.Color: Int] = [:]
+        var count = 0
+        for row in snapshot.rows {
+            for cell in row.cells {
+                let attribute = cell.attribute
+                let background = attribute.style.contains(.inverse) ? attribute.fg : attribute.bg
+                backgrounds[background, default: 0] += 1
+                count += 1
+            }
+        }
+        // A selection, border or status bar must not replace the skin's background.
+        guard let dominant = backgrounds.max(by: { $0.value < $1.value }), dominant.value > count / 2,
+              case let .trueColor(red, green, blue) = dominant.key else { return }
+        let color = NSColor(srgbRed: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: 1)
+        guard let current = terminal.nativeBackgroundColor.usingColorSpace(.sRGB),
+              abs(current.redComponent - color.redComponent) > 0.0001 ||
+                abs(current.greenComponent - color.greenComponent) > 0.0001 ||
+                abs(current.blueComponent - color.blueComponent) > 0.0001 else { return }
+        terminal.nativeBackgroundColor = color
+    }
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {}
@@ -42,22 +90,48 @@ import SwiftUI
 /// Shows the model's terminal, adopting it from whichever pane last held it.
 struct K9sTerminalHost: NSViewRepresentable {
     let terminal: NSView
+    let appearance: K9sAppearance
     let takeFocusRequest: () -> Bool
 
     func makeNSView(context: Context) -> Container { Container() }
 
     func updateNSView(_ container: Container, context: Context) {
         container.takeFocusRequest = takeFocusRequest
+        container.appearance = appearance.nativeAppearance
+        container.wantsLayer = true
         guard terminal.superview !== container else { return }
         terminal.removeFromSuperview()
-        terminal.frame = container.bounds
-        terminal.autoresizingMask = [.width, .height]
+        terminal.appearance = appearance.nativeAppearance
+        terminal.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(terminal)
+        NSLayoutConstraint.activate([
+            terminal.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            terminal.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            terminal.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            terminal.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8)
+        ])
+        container.followBackground(of: terminal, fallback: appearance.backgroundColor)
         container.focusIfRequested()
     }
 
     final class Container: NSView {
         var takeFocusRequest: (() -> Bool)?
+        private var backgroundObservation: NSKeyValueObservation?
+
+        /// SwiftTerm updates its backing layer for native colors, OSC changes and reverse video.
+        /// Follow that color so the inset stays continuous with the terminal without polling.
+        func followBackground(of terminal: NSView, fallback: NSColor) {
+            backgroundObservation = nil
+            layer?.backgroundColor = fallback.cgColor
+            backgroundObservation = terminal.layer?.observe(\.backgroundColor, options: [.initial, .new]) { [weak self] layer, _ in
+                self?.layer?.backgroundColor = layer.backgroundColor ?? fallback.cgColor
+            }
+        }
+
+        override func willRemoveSubview(_ subview: NSView) {
+            backgroundObservation = nil
+            super.willRemoveSubview(subview)
+        }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -111,7 +185,8 @@ struct K9sDetailView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                K9sTerminalHost(terminal: session.terminal.view, takeFocusRequest: model.takeK9sFocusRequest)
+                K9sTerminalHost(terminal: session.terminal.view, appearance: session.appearance,
+                                takeFocusRequest: { model.takeK9sFocusRequest(for: session.id) })
                     .id(session.id)
                     .accessibilityLabel("k9s terminal for \(session.contextName)")
             }
