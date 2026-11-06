@@ -40,6 +40,12 @@ private struct DraftEvaluation {
 private struct DraftStep {
     var text: String
     var context: String?
+    var selection: EntrySelection?
+}
+
+private struct EntrySelection {
+    let section: AppSection
+    let names: Set<String>
 }
 
 /// One context's k9s, which keeps running while other entries are on screen.
@@ -89,19 +95,19 @@ struct EntryEditor: Equatable {
 final class AppModel: ObservableObject {
     @Published var section: AppSection = .contexts
     @Published var selectedName: String?
-    @Published private(set) var selectedContextNames: Set<String> = [] {
-        didSet { if selectedContextNames != oldValue { contextSelectionGeneration &+= 1 } }
+    @Published private(set) var selectedEntryNames: Set<String> = [] {
+        didSet { if selectedEntryNames != oldValue { entrySelectionGeneration &+= 1 } }
     }
     @Published var search = "" {
         didSet {
             guard search != oldValue else { return }
-            contextSelectionGeneration &+= 1
-            guard section == .contexts else { return }
+            entrySelectionGeneration &+= 1
+            guard section.kind != nil else { return }
             let visible = Set(visibleEntries.map(\.name))
-            guard !selectedContextNames.isSubset(of: visible) else { return }
+            guard !selectedEntryNames.isSubset(of: visible) else { return }
             do {
                 try flushEditor()
-                applyContextSelection(selectedContextNames.intersection(visibleEntries.map(\.name)))
+                applyEntrySelection(selectedEntryNames.intersection(visibleEntries.map(\.name)))
             } catch {
                 search = oldValue
                 errorMessage = error.localizedDescription
@@ -137,13 +143,14 @@ final class AppModel: ObservableObject {
     @Published var searchFocusRequest = 0
     @Published private(set) var recentFiles: [URL]
     @Published var showRaw = false {
-        didSet { if showRaw != oldValue { contextSelectionGeneration &+= 1 } }
+        didSet { if showRaw != oldValue { entrySelectionGeneration &+= 1 } }
     }
     @Published var showReview = false
     @Published var showImport = false
     @Published var importPlan: ImportPlan?
     @Published var showImportSource = false
     @Published private(set) var contextExportPlan: ContextExportPlan?
+    @Published private var confirmingDeletion = false
     @Published var wrapsYAML: Bool { didSet { defaults.set(wrapsYAML, forKey: Self.wrapsYAMLKey) } }
     @Published private(set) var k9sSessions: [String: K9sSession] = [:]
     var k9sSession: K9sSession? { selectedName.flatMap { k9sSessions[$0] } }
@@ -164,7 +171,7 @@ final class AppModel: ObservableObject {
     private var evaluation: DraftEvaluation?
     /// The draft when YAML editing began. The whole session becomes one undo step.
     private var rawSessionStart: String?
-    private var contextSelectionGeneration: UInt64 = 0
+    private var entrySelectionGeneration: UInt64 = 0
     private static let historyLimit = 100
     private static let wrapsYAMLKey = "wrapsYAML"
     private static let sidebarCollapsedKey = "sidebarCollapsed"
@@ -211,13 +218,15 @@ final class AppModel: ObservableObject {
     var formIsDirty: Bool { editor != loadedEditor }
     var hasPendingChanges: Bool { draftText != (snapshot?.text ?? "") || formIsDirty }
     var needsAttentionBeforeLeaving: Bool { hasPendingChanges || recoveryContents != nil }
-    var sheetIsOpen: Bool { showReview || showImportSource || showImport || contextExportPlan != nil }
-    var hasMultipleContextSelection: Bool { section == .contexts && selectedContextNames.count > 1 }
+    var sheetIsOpen: Bool { showReview || showImportSource || showImport || contextExportPlan != nil || confirmingDeletion }
+    var hasMultipleSelection: Bool { section.kind != nil && selectedEntryNames.count > 1 }
+    var canRequestSelectionDeletion: Bool { hasMultipleSelection && !showRaw && document != nil && !sheetIsOpen }
+    var selectionDeleteTitle: String { "Delete \(selectedEntryNames.count) Items" }
     var canExportContexts: Bool {
-        section == .contexts && !showRaw && document != nil && !selectedContextNames.isEmpty && !sheetIsOpen
+        section == .contexts && !showRaw && document != nil && !selectedEntryNames.isEmpty && !sheetIsOpen
     }
     var contextExportTitle: String {
-        let count = selectedContextNames.count
+        let count = selectedEntryNames.count
         return count == 0 ? "Export Selected Contexts" : "Export \(count) Selected Context\(count == 1 ? "" : "s")"
     }
     /// No file, or a blank one such as `touch ~/.kube/config` leaves, so there's nothing to edit yet.
@@ -285,14 +294,13 @@ final class AppModel: ObservableObject {
     }
     /// Why an entry can't be deleted, for disabled buttons and menu items.
     func deleteBlockReason(_ name: String) -> String? {
-        guard !hasMultipleContextSelection else { return "Select a single context to delete" }
         guard let kind = section.kind, let document else { return "Nothing to delete" }
         let count = document.referencingContexts(kind, name: name).count
         return count == 0 ? nil : "Used by \(count) context\(count == 1 ? "" : "s")"
     }
     /// Why k9s can't open a context. It reads the file, so it would miss pending changes to what the context connects with.
     func k9sBlockReason(_ name: String?) -> String? {
-        guard !sheetIsOpen, !showRaw, section == .contexts, !hasMultipleContextSelection, let name else { return "Select a single context" }
+        guard !sheetIsOpen, !showRaw, section == .contexts, !hasMultipleSelection, let name else { return "Select a single context" }
         // A bad name can't be previewed, and flushing it would raise an alert on every click behind the terminal.
         if nameError != nil, name == editor?.originalName { return "Fix the name to open in k9s" }
         guard let preview = evaluated.preview else { return "Repair the configuration to open in k9s" }
@@ -332,7 +340,7 @@ final class AppModel: ObservableObject {
             if loaded.exists { noteRecentFile(loaded.url) }
             draftText = loaded.text
             parseDraft()
-            clearEditor(); selectedName = nil; selectedContextNames = []; search = ""
+            clearEditor(); selectedName = nil; selectedEntryNames = []; search = ""
             showRaw = false; statusMessage = nil; backupWarning = nil
             clearHistory()
             selectFirstEntry()
@@ -379,13 +387,13 @@ final class AppModel: ObservableObject {
         return document?.entry(kind, named: name)
     }
 
-    func stage(_ next: KubeDocument, message: String? = nil) throws {
+    func stage(_ next: KubeDocument, message: String? = nil, undoSelection: Set<String>? = nil) throws {
         let next = diskDocument.map(next.adoptingKeyOrder) ?? next
         let serialized = try next.serialized()
         // Keep the file's own text when nothing differs, so changing a value back leaves nothing to apply.
         let unchanged = diskDocument?.isEquivalent(to: next) == true
         let text = unchanged ? (snapshot?.text ?? serialized) : serialized
-        if text != draftText { recordStep() }
+        if text != draftText { recordStep(undoSelection: undoSelection) }
         document = unchanged ? diskDocument : next
         draftText = text
         parseIssue = nil
@@ -394,14 +402,14 @@ final class AppModel: ObservableObject {
     }
 
     /// Saves the current draft as the state Undo returns to. Call before changing it.
-    private func recordStep() {
+    private func recordStep(undoSelection: Set<String>? = nil) {
         endRawSession()
-        pushUndo(draftText)
+        pushUndo(draftText, selection: undoSelection.map { EntrySelection(section: section, names: $0) })
         redoStack.removeAll()
     }
 
-    private func pushUndo(_ text: String) {
-        undoStack.append(DraftStep(text: text))
+    private func pushUndo(_ text: String, selection: EntrySelection? = nil) {
+        undoStack.append(DraftStep(text: text, selection: selection))
         if undoStack.count > Self.historyLimit { undoStack.removeFirst() }
     }
 
@@ -424,8 +432,8 @@ final class AppModel: ObservableObject {
         guard (try? flushEditor()) != nil else { editor = loadedEditor; return }
         endRawSession()
         guard let previous = undoStack.popLast() else { return }
-        redoStack.append(DraftStep(text: draftText))
-        restore(following(previous))
+        redoStack.append(DraftStep(text: draftText, selection: previous.selection))
+        restore(following(previous), selection: previous.selection)
     }
 
     func redo() {
@@ -436,7 +444,7 @@ final class AppModel: ObservableObject {
         // An unfinished form edit is a new change, so committing it empties the redo stack.
         guard (try? flushEditor()) != nil, let next = redoStack.popLast() else { return }
         endRawSession()
-        pushUndo(draftText)
+        pushUndo(draftText, selection: next.selection)
         restore(following(next))
     }
 
@@ -454,12 +462,18 @@ final class AppModel: ObservableObject {
         return !showRaw && formIsDirty && key.firstResponder is NSText
     }
 
-    private func restore(_ text: String) {
+    private func restore(_ text: String, selection: EntrySelection? = nil) {
         let previous = document
         draftText = text
         parseDraft()
         statusMessage = nil
         clearEditor()
+        if let selection {
+            section = selection.section
+            search = ""
+            applyEntrySelection(selection.names.intersection(visibleEntries.map(\.name)))
+            return
+        }
         guard !showRaw else { return }
         let changed = section.kind.flatMap { kind -> String? in
             let old = previous?.entriesByName(kind) ?? [:]
@@ -471,9 +485,9 @@ final class AppModel: ObservableObject {
 
     /// Selects `preferred`, or else keeps the current entry if it still exists.
     private func reselect(_ preferred: String? = nil) {
-        if preferred == nil, hasMultipleContextSelection {
-            let remaining = selectedContextNames.intersection(visibleEntries.map(\.name))
-            if !remaining.isEmpty { selectContexts(remaining); return }
+        if preferred == nil, hasMultipleSelection {
+            let remaining = selectedEntryNames.intersection(visibleEntries.map(\.name))
+            if !remaining.isEmpty { selectEntries(remaining); return }
         }
         if let target = preferred ?? sectionEntry(named: selectedName)?.name { reveal(target) } else { selectFirstEntry() }
     }
@@ -506,7 +520,7 @@ final class AppModel: ObservableObject {
         try stage(next)
         let name = editor.name.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedName = name
-        if editor.kind == .contexts { selectedContextNames = [name] }
+        selectedEntryNames = [name]
         showEditor(for: next.entry(editor.kind, named: name))
         clearSearchIfHiding(name)
         return true
@@ -516,7 +530,7 @@ final class AppModel: ObservableObject {
         reportingErrors {
             try flushEditor()
             endRawSession()
-            selectedContextNames = []
+            selectedEntryNames = []
             section = next; search = ""; showRaw = false
             clearEditor(); selectedName = nil
             if next == .backups { refreshBackups() } else { selectFirstEntry() }
@@ -527,7 +541,8 @@ final class AppModel: ObservableObject {
         reportingErrors {
             try flushEditor()
             selectedName = name
-            if section == .contexts { selectedContextNames = name.map { [$0] } ?? [] }
+            entrySelectionGeneration &+= 1
+            selectedEntryNames = name.map { [$0] } ?? []
             showEditor(for: sectionEntry(named: name))
         }
     }
@@ -535,18 +550,18 @@ final class AppModel: ObservableObject {
     func selectFirstEntry() { selectEntry(visibleEntries.first?.name) }
 
     /// AppKit can report selection during a SwiftUI update. Keep only the latest still-current request.
-    func queueContextSelection(_ names: Set<String>) {
-        contextSelectionGeneration &+= 1
-        let generation = contextSelectionGeneration
+    func queueEntrySelection(_ names: Set<String>) {
+        entrySelectionGeneration &+= 1
+        let generation = entrySelectionGeneration
         DispatchQueue.main.async { [weak self] in
-            guard let self, generation == self.contextSelectionGeneration,
-                  self.section == .contexts, !self.showRaw, !self.sheetIsOpen else { return }
-            self.selectContexts(names)
+            guard let self, generation == self.entrySelectionGeneration,
+                  self.section.kind != nil, !self.showRaw, !self.sheetIsOpen else { return }
+            self.selectEntries(names)
         }
     }
 
-    func selectContexts(_ names: Set<String>) {
-        guard section == .contexts, names != selectedContextNames else { return }
+    func selectEntries(_ names: Set<String>) {
+        guard section.kind != nil, names != selectedEntryNames else { return }
         reportingErrors {
             let originalName = editor?.originalName
             try flushEditor()
@@ -554,12 +569,13 @@ final class AppModel: ObservableObject {
             // A focus change can commit a rename while the list is still sending its old selection.
             if let originalName, let renamed = editor?.originalName, originalName != renamed,
                names.remove(originalName) != nil { names.insert(renamed) }
-            applyContextSelection(names.intersection(visibleEntries.map(\.name)))
+            applyEntrySelection(names.intersection(visibleEntries.map(\.name)))
         }
     }
 
-    private func applyContextSelection(_ names: Set<String>) {
-        selectedContextNames = names
+    private func applyEntrySelection(_ names: Set<String>) {
+        entrySelectionGeneration &+= 1
+        selectedEntryNames = names
         selectedName = names.count == 1 ? names.first : nil
         showEditor(for: showRaw ? nil : sectionEntry(named: selectedName))
     }
@@ -593,7 +609,7 @@ final class AppModel: ObservableObject {
     }
 
     func makeActive(_ name: String? = nil) {
-        guard !hasMultipleContextSelection else { return }
+        guard !hasMultipleSelection else { return }
         reportingErrors {
             guard let name = try flushed(name ?? selectedName) else { return }
             try switchContext(to: name, stagedMessage: "Context switch staged")
@@ -601,7 +617,7 @@ final class AppModel: ObservableObject {
     }
 
     func clearActive() {
-        guard !hasMultipleContextSelection else { return }
+        guard !hasMultipleSelection else { return }
         reportingErrors {
             try flushEditor()
             try switchContext(to: "", stagedMessage: "Active context cleared")
@@ -627,8 +643,8 @@ final class AppModel: ObservableObject {
         guard let written else { try stage(next, message: stagedMessage); return }
         // History holds whole drafts, so without this Undo would bring the old context back as a pending change.
         self.snapshot = written
-        undoStack = undoStack.map { DraftStep(text: $0.text, context: name) }
-        redoStack = redoStack.map { DraftStep(text: $0.text, context: name) }
+        undoStack = undoStack.map { var step = $0; step.context = name; return step }
+        redoStack = redoStack.map { var step = $0; step.context = name; return step }
         document = next
         draftText = draft(text, following: name)
         statusMessage = nil
@@ -646,7 +662,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteEntry(_ requested: String? = nil) {
-        guard !hasMultipleContextSelection else { return }
+        guard !hasMultipleSelection else { return }
         reportingErrors {
             guard let kind = section.kind, let name = try flushed(requested ?? selectedName), var next = document else { return }
             if kind == .contexts && next.currentContext == name {
@@ -664,9 +680,38 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func requestSelectionDeletion() {
+        guard canRequestSelectionDeletion else { return }
+        reportingErrors {
+            try flushEditor()
+            guard let kind = section.kind, let original = document else { return }
+            let names = selectedEntryNames.intersection(visibleEntries.map(\.name))
+            guard names.count > 1 else { return }
+            let originalSection = section
+            let url = snapshot?.url
+            entrySelectionGeneration &+= 1
+            confirmingDeletion = true
+            defer {
+                confirmingDeletion = false
+                entrySelectionGeneration &+= 1
+            }
+            var next = original
+            do { try next.delete(kind, names: names) } catch {
+                _ = ask("Cannot delete selected items", error.localizedDescription, ["OK"])
+                return
+            }
+            let choice = ask("Delete \(names.count) \(kind.title.lowercased())?",
+                             "Changes take effect after Apply. You can undo this deletion.", ["Delete", "Cancel"])
+            guard choice == 0, section == originalSection, document == original, snapshot?.url == url else { return }
+            try stage(next, undoSelection: names)
+            applyEntrySelection([])
+            selectFirstEntry()
+        }
+    }
+
     func openK9s(_ requested: String? = nil) {
         guard let name = requested ?? selectedName, k9sBlockReason(name) == nil else { return }
-        if selectedName != name || selectedContextNames != [name] { selectEntry(name) }
+        if selectedName != name || selectedEntryNames != [name] { selectEntry(name) }
         guard selectedName == name, let snapshot else { return }
         if let session = k9sSessions[name] {
             let view = session.terminal.view
@@ -797,7 +842,7 @@ final class AppModel: ObservableObject {
     }
 
     func duplicateEntry(_ requested: String) {
-        guard !hasMultipleContextSelection else { return }
+        guard !hasMultipleSelection else { return }
         reportingErrors {
             guard let kind = section.kind, let name = try flushed(requested), var next = document else { return }
             let copy = try next.duplicate(kind, name: name)
@@ -1053,7 +1098,7 @@ final class AppModel: ObservableObject {
         reportingErrors {
             try flushEditor()
             guard let document, let snapshot else { return }
-            let names = selectedContextNames.intersection(visibleEntries.map(\.name))
+            let names = selectedEntryNames.intersection(visibleEntries.map(\.name))
             contextExportPlan = try ContextExportPlan(document: document, contextNames: names,
                                                      sourceDirectory: snapshot.url.deletingLastPathComponent())
         }

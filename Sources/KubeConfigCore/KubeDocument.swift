@@ -288,11 +288,37 @@ public struct KubeDocument: Equatable {
         return entries(.contexts).filter { $0.value(kind.singular) == name }.map(\.name)
     }
 
+    /// Groups references to a selection in one traversal, omitting entries that are not in use.
+    public func referencingContexts(_ kind: EntryKind, names: Set<String>) -> [String: [String]] {
+        guard kind != .contexts, !names.isEmpty else { return [:] }
+        var references: [String: [String]] = [:]
+        for context in entries(.contexts) {
+            let name = context.value(kind.singular)
+            if names.contains(name) { references[name, default: []].append(context.name) }
+        }
+        return references
+    }
+
     public mutating func delete(_ kind: EntryKind, name: String) throws {
         guard entry(kind, named: name) != nil else { throw ConfigError.missingEntry(name) }
         let references = referencingContexts(kind, name: name)
         guard references.isEmpty else { throw ConfigError.referenced(name, references) }
         root[kind.rawValue] = Node(entries(kind).filter { $0.name != name }.map(\.node))
+    }
+
+    /// Deletes the entire selection or leaves the document untouched if any entry cannot be deleted.
+    public mutating func delete(_ kind: EntryKind, names: Set<String>) throws {
+        guard !names.isEmpty else { return }
+        let entries = entries(kind)
+        let existing = Set(entries.map(\.name))
+        if let missing = names.subtracting(existing).sorted().first { throw ConfigError.missingEntry(missing) }
+        let references = referencingContexts(kind, names: names)
+        let blocked = references.keys.sorted().map { name in
+            ConfigError.referenced(name, references[name, default: []].sorted()).localizedDescription
+        }
+        guard blocked.isEmpty else { throw ConfigError.invalid(blocked.joined(separator: "\n")) }
+        if kind == .contexts, names.contains(currentContext) { try setCurrentContext("") }
+        root[kind.rawValue] = Node(entries.filter { !names.contains($0.name) }.map(\.node))
     }
 
     public var hasRelativePaths: Bool {

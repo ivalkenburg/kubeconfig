@@ -28,6 +28,26 @@ import KubeConfigCore
                 await wait(milliseconds)
                 if let sheet = window.attachedSheet { save(sheet, to: folder.appendingPathComponent("\(name).png")) }
             }
+            @MainActor func deletionShot(_ name: String) {
+                let originalAsk = model.ask
+                model.ask = { message, detail, buttons in
+                    let timer = Timer(timeInterval: 0.5, repeats: false) { _ in
+                        MainActor.assumeIsolated {
+                            if let dialog = NSApp.modalWindow {
+                                save(dialog, to: folder.appendingPathComponent("\(name).png"), fromScreen: true)
+                                NSApp.abortModal()
+                                dialog.orderOut(nil)
+                            }
+                        }
+                    }
+                    RunLoop.main.add(timer, forMode: .modalPanel)
+                    defer { timer.invalidate() }
+                    _ = originalAsk(message, detail, buttons)
+                    return buttons.count == 1 ? 0 : 1
+                }
+                defer { model.ask = originalAsk }
+                model.requestSelectionDeletion()
+            }
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
             setAppearance(.aqua)
@@ -61,10 +81,24 @@ import KubeConfigCore
                 model.refreshBackups()
             }
             model.selectSection(.contexts)
-            model.selectContexts(["development", "production-eu"])
+            model.selectEntries(["development", "production-eu"])
             await shot("contexts-multiple")
             window.setContentSize(NSSize(width: 920, height: 600))
             await shot("contexts-multiple-compact")
+            deletionShot("delete-contexts-light")
+            setAppearance(.darkAqua)
+            deletionShot("delete-contexts-dark")
+            setAppearance(.aqua)
+            model.selectSection(.clusters)
+            model.selectEntries(["development", "production-eu"])
+            await shot("clusters-multiple")
+            deletionShot("delete-clusters-blocked")
+            model.selectSection(.users)
+            model.selectEntries(["developer", "local-admin"])
+            await shot("users-multiple")
+            deletionShot("delete-users-blocked")
+            model.selectSection(.contexts)
+            model.selectEntries(["development", "production-eu"])
             model.requestContextExport()
             await sheetShot("context-export", after: 500)
             model.closeContextExport()
@@ -167,10 +201,17 @@ import KubeConfigCore
     }
 
     /// Uses the window server, since cacheDisplay can't draw the Liquid Glass sidebar.
-    private static func save(_ window: NSWindow, to url: URL) {
+    private static func save(_ window: NSWindow, to url: URL, fromScreen: Bool = false) {
         let capture = Process()
         capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        capture.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", url.path]
+        if fromScreen, let screen = NSScreen.screens.first {
+            // Native alerts draw outside their window's capture surface on macOS 26.
+            let frame = window.frame
+            let region = "\(Int(frame.minX)),\(Int(screen.frame.maxY - frame.maxY)),\(Int(frame.width)),\(Int(frame.height))"
+            capture.arguments = ["-x", "-R", region, url.path]
+        } else {
+            capture.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", url.path]
+        }
         try? capture.run()
         capture.waitUntilExit()
     }

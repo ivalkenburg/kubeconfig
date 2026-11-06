@@ -29,7 +29,7 @@ One file at a time, initially ~/.kube/config. Alternate files can be opened. No 
 - Stage all changes and step through a diff before Apply. Undo and Redo step through staged actions until Apply; Discard is one undoable step. Prompt on closing with pending changes; quit when the last window closes.
 - Focused forms and a syntax-highlighted raw YAML editor, one toggle away. Preserve all values, unknown fields, and extensions; comments and formatting may change.
 - File and pasted-YAML import with preview, Rename/Replace/Skip choices, reuse of identical entries, updated references, and rebased file paths. Relative paths in pasted YAML require a source folder.
-- Rename updates references. Block deletion of referenced users/clusters, and say why before the attempt. Deletes are staged and undoable, so only active-context deletion confirms, offering to clear the active context.
+- Rename updates references. Block deletion of referenced users/clusters, and say why before the attempt. Multi-select within Contexts, Clusters, or Users to delete selected entries with one confirmation and one Undo step; keep related entries. Single-entry deletion confirms only for the active context. Bulk deletion clears a selected active context without another warning. Deletes are staged until Apply.
 - Reject invalid configurations and external modification conflicts. Notice outside changes when the app comes forward, leaving Reload to the user. Allow exporting the draft before reload.
 - After a successful Apply, save the previous contents as an undo point. Rolling backups per file, default 10, configurable including zero. Trim on the next successful Apply.
 - Rollback stages a backup; Apply reviews and commits it, backing up the replaced configuration.

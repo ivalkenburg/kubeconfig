@@ -1,22 +1,6 @@
 import KubeConfigCore
 import SwiftUI
 
-struct ContextSelectionSummary: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(spacing: 12) {
-            Text("\(model.selectedContextNames.count) contexts selected").font(.title2).fontWeight(.semibold)
-            Text("Export these contexts and their clusters and users in one kubeconfig.")
-                .font(.callout).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).frame(maxWidth: 360)
-            Button("Preview Export…", action: model.requestContextExport)
-                .buttonStyle(.borderedProminent).disabled(!model.canExportContexts)
-        }
-        .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
 struct ContextExportSheet: View {
     @ObservedObject var model: AppModel
     @State private var issue: String?

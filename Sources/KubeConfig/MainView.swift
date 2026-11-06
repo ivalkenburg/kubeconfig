@@ -172,28 +172,28 @@ struct MainView: View {
                 }
             }
         } else {
-            Group {
-                if kind == .contexts {
-                    List(selection: Binding(get: { model.selectedContextNames }, set: model.queueContextSelection)) {
-                        entryRows(entries, changes: changes)
-                    }
-                } else {
-                    List(selection: Binding<String?>(get: { model.selectedName }, set: { if $0 != model.selectedName { model.selectEntry($0) } })) {
-                        entryRows(entries, changes: changes)
-                    }
-                }
+            List(selection: Binding(get: { model.selectedEntryNames }, set: model.queueEntrySelection)) {
+                entryRows(entries, changes: changes)
             }
             .contextMenu(forSelectionType: String.self) { names in
-                if kind == .contexts, names.count > 1 || model.hasMultipleContextSelection {
-                    Button(model.contextExportTitle, action: model.requestContextExport).disabled(!model.canExportContexts)
-                    Divider()
-                    Button("Make Active") {}.disabled(true)
-                    Button("Open in k9s") {}.disabled(true)
+                if names.count > 1 {
+                    if kind == .contexts {
+                        Button(model.contextExportTitle) {
+                            model.selectEntries(names)
+                            model.requestContextExport()
+                        }.disabled(!model.canExportContexts)
+                        Divider()
+                        Button("Make Active") {}.disabled(true)
+                        Button("Open in k9s") {}.disabled(true)
+                    }
                     Button("Duplicate") {}.disabled(true)
-                    Button("Delete", role: .destructive) {}.disabled(true)
+                    Button("Delete \(names.count) Items…", role: .destructive) {
+                        model.selectEntries(names)
+                        model.requestSelectionDeletion()
+                    }.disabled(!model.canRequestSelectionDeletion)
                 } else if let entry = entries.first(where: { names.contains($0.name) }) { entryMenu(entry) }
             } primaryAction: { names in
-                if names.count == 1, !model.hasMultipleContextSelection,
+                if names.count == 1, !model.hasMultipleSelection,
                    let entry = entries.first(where: { names.contains($0.name) }), entry.kind == .contexts, !isActive(entry) {
                     model.makeActive(entry.name)
                 }
@@ -230,14 +230,14 @@ struct MainView: View {
     @ViewBuilder private func entryMenu(_ entry: ConfigEntry) -> some View {
         if entry.kind == .contexts {
             if isActive(entry) {
-                Button("Clear Active Context", action: model.clearActive)
+                Button("Clear Active Context") { performEntryMenuAction(entry, action: model.clearActive) }
             } else {
-                Button("Make Active") { model.makeActive(entry.name) }
+                Button("Make Active") { performEntryMenuAction(entry) { model.makeActive(entry.name) } }
             }
             Button("Open in k9s") { model.openK9s(entry.name) }.disabled(model.k9sBlockReason(entry.name) != nil)
             Divider()
         }
-        Button("Duplicate") { model.duplicateEntry(entry.name) }
+        Button("Duplicate") { performEntryMenuAction(entry) { model.duplicateEntry(entry.name) } }
         Button("Copy Name") { model.copyToPasteboard(entry.name) }
         if entry.kind == .clusters {
             Button("Copy Server URL") { model.copyToPasteboard(entry.value("server")) }
@@ -246,9 +246,15 @@ struct MainView: View {
         Divider()
         let blocked = model.deleteBlockReason(entry.name)
         Button(blocked.map { "Delete (\($0.lowercased()))" } ?? (isActive(entry) ? "Delete…" : "Delete"), role: .destructive) {
-            model.deleteEntry(entry.name)
+            performEntryMenuAction(entry) { model.deleteEntry(entry.name) }
         }
         .disabled(blocked != nil)
+    }
+
+    private func performEntryMenuAction(_ entry: ConfigEntry, action: () -> Void) {
+        // A right-click outside a multi-selection targets that row without changing the list's selection.
+        if model.hasMultipleSelection { model.selectEntry(entry.name) }
+        action()
     }
 
     @ViewBuilder private var backupList: some View {
@@ -337,8 +343,8 @@ struct MainView: View {
                         Button("Open YAML Editor", action: model.toggleRawEditor).buttonStyle(.borderedProminent)
                         Button("Open Another File…", action: model.openConfiguration)
                     }
-                } else if model.hasMultipleContextSelection {
-                    ContextSelectionSummary(model: model)
+                } else if model.hasMultipleSelection {
+                    EntrySelectionSummary(model: model)
                 } else if model.k9sIsVisible, let session = model.k9sSession {
                     K9sDetailView(model: model, session: session)
                 } else if model.editor != nil {

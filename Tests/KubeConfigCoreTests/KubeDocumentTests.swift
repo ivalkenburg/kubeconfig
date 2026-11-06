@@ -15,6 +15,106 @@ final class KubeDocumentTests: XCTestCase {
 
     func testEmptyConfigurationIsValid() throws { try KubeDocument.empty.validate() }
 
+    func testBulkDeleteContextsClearsSelectedActiveContextAndRetainsRelatedEntries() throws {
+        var document = try KubeDocument(yaml: """
+        clusters:
+        - {name: shared, cluster: {server: 'https://example.invalid'}}
+        users:
+        - {name: shared, user: {token: example}}
+        contexts:
+        - {name: a, context: {cluster: shared, user: shared}}
+        - {name: b, context: {cluster: shared, user: shared}}
+        current-context: a
+        vendor-data: {enabled: true}
+        """)
+        try document.delete(.contexts, names: ["a", "b"])
+        XCTAssertTrue(document.entries(.contexts).isEmpty)
+        XCTAssertEqual(document.currentContext, "")
+        XCTAssertEqual(document.entries(.clusters).map(\.name), ["shared"])
+        XCTAssertEqual(document.entries(.users).map(\.name), ["shared"])
+        XCTAssertEqual(document.root["vendor-data"]?["enabled"]?.bool, true)
+        try document.validate()
+    }
+
+    func testBulkDeleteIsAtomicForMissingAndReferencedEntries() throws {
+        let original = try KubeDocument(yaml: """
+        clusters:
+        - {name: free, cluster: {server: 'https://free.invalid'}}
+        - {name: used, cluster: {server: 'https://used.invalid'}}
+        users:
+        - {name: free, user: {}}
+        - {name: used, user: {}}
+        contexts:
+        - {name: a, context: {cluster: used, user: used}}
+        - {name: b, context: {cluster: used, user: used}}
+        current-context: a
+        """)
+        for kind in EntryKind.referenced {
+            var document = original
+            XCTAssertThrowsError(try document.delete(kind, names: ["free", "used"])) { error in
+                for name in ["used", "a", "b"] { XCTAssertTrue(error.localizedDescription.contains(name)) }
+            }
+            XCTAssertEqual(document, original)
+            XCTAssertThrowsError(try document.delete(kind, names: ["free", "missing"]))
+            XCTAssertEqual(document, original)
+        }
+        var document = original
+        XCTAssertThrowsError(try document.delete(.contexts, names: ["a", "missing"]))
+        XCTAssertEqual(document, original, "A missing item must not clear the active context")
+        try document.delete(.contexts, names: [])
+        XCTAssertEqual(document, original)
+    }
+
+    func testBulkDeleteRetainsUnselectedEntriesAndUnknownFieldsInOrder() throws {
+        for kind in EntryKind.referenced {
+            var document = try KubeDocument(yaml: """
+            \(kind.rawValue):
+            - {name: c, \(kind.singular): {vendor-setting: keep}}
+            - {name: a, \(kind.singular): {}}
+            - {name: b, \(kind.singular): {}}
+            """)
+            try document.delete(kind, names: ["a", "b"])
+            XCTAssertEqual(document.entries(kind).map(\.name), ["c"])
+            XCTAssertEqual(document.entry(kind, named: "c")?.value("vendor-setting"), "keep")
+        }
+    }
+
+    func testBulkReferencesGroupOnlySelectedEntriesAndKeepContextOrder() throws {
+        let document = try KubeDocument(yaml: """
+        contexts:
+        - {name: z, context: {cluster: first, user: second}}
+        - {name: a, context: {cluster: first, user: first}}
+        - {name: b, context: {cluster: second, user: first}}
+        - {name: unrelated, context: {cluster: other}}
+        - {name: anonymous, context: {cluster: first}}
+        """)
+        XCTAssertEqual(document.referencingContexts(.clusters, names: ["first", "second", "free"]),
+                       ["first": ["z", "a", "anonymous"], "second": ["b"]])
+        XCTAssertEqual(document.referencingContexts(.users, names: ["first", "second", "free"]),
+                       ["first": ["a", "b"], "second": ["z"]])
+        XCTAssertEqual(document.referencingContexts(.clusters, names: ["first"]), ["first": ["z", "a", "anonymous"]])
+        XCTAssertTrue(document.referencingContexts(.clusters, names: ["free"]).isEmpty)
+        XCTAssertTrue(document.referencingContexts(.users, names: []).isEmpty)
+        XCTAssertTrue(document.referencingContexts(.contexts, names: ["first"]).isEmpty)
+    }
+
+    func testBulkDeleteReportsAllBlockingEntriesWithoutDeletingFreeEntries() throws {
+        var document = try KubeDocument(yaml: """
+        clusters:
+        - {name: first, cluster: {server: 'https://first.invalid'}}
+        - {name: second, cluster: {server: 'https://second.invalid'}}
+        - {name: free, cluster: {server: 'https://free.invalid'}}
+        contexts:
+        - {name: context-a, context: {cluster: first}}
+        - {name: context-b, context: {cluster: second}}
+        """)
+        let original = document
+        XCTAssertThrowsError(try document.delete(.clusters, names: ["first", "second", "free"])) { error in
+            for name in ["first", "second", "context-a", "context-b"] { XCTAssertTrue(error.localizedDescription.contains(name)) }
+        }
+        XCTAssertEqual(document, original)
+    }
+
     private func kubeconfig(_ active: String) -> String {
         """
         # top comment

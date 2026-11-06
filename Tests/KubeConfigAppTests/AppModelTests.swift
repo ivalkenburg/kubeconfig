@@ -1451,8 +1451,8 @@ final class AppModelTests: XCTestCase {
     func testContextMultiSelectionCommitsTheFormAndDisablesSingleEntryActions() async throws {
         try await withModel { model, _ in
             model.editor?.fields["namespace"] = "pending"
-            model.selectContexts(["dev", "other"])
-            XCTAssertTrue(model.hasMultipleContextSelection)
+            model.selectEntries(["dev", "other"])
+            XCTAssertTrue(model.hasMultipleSelection)
             XCTAssertNil(model.selectedName)
             XCTAssertNil(model.editor)
             XCTAssertEqual(model.document?.entry(.contexts, named: "dev")?.value("namespace"), "pending")
@@ -1463,11 +1463,280 @@ final class AppModelTests: XCTestCase {
             model.duplicateEntry("dev")
             model.deleteEntry("other")
             XCTAssertEqual(model.draftText, draft)
-            XCTAssertNotNil(model.deleteBlockReason("dev"))
-            model.selectContexts(["other"])
+            XCTAssertNil(model.deleteBlockReason("dev"))
+            model.selectEntries(["other"])
             XCTAssertEqual(model.selectedName, "other")
             XCTAssertEqual(model.editor?.originalName, "other")
-            XCTAssertFalse(model.hasMultipleContextSelection)
+            XCTAssertFalse(model.hasMultipleSelection)
+        }
+    }
+
+    func testBulkContextDeletionConfirmsOnceStagesAndRestoresSelectionOnUndo() async throws {
+        let yaml = Self.fixture.replacingOccurrences(of: "contexts:\n", with: "contexts:\n- name: remaining\n  context: {cluster: dev}\n")
+        try await withModel(initial: yaml, immediate: true) { model, url in
+            model.selectEntries(["dev", "other"])
+            var confirmations = 0
+            model.ask = { title, detail, buttons in
+                confirmations += 1
+                XCTAssertEqual(title, "Delete 2 contexts?")
+                XCTAssertEqual(detail, "Changes take effect after Apply. You can undo this deletion.")
+                XCTAssertEqual(buttons, ["Delete", "Cancel"])
+                XCTAssertTrue(model.sheetIsOpen)
+                XCTAssertEqual(model.draftText, yaml, "Opening confirmation must not change the draft")
+                return 0
+            }
+            model.requestSelectionDeletion()
+            XCTAssertEqual(confirmations, 1, "Deleting the active context adds no second warning")
+            XCTAssertFalse(model.sheetIsOpen)
+            XCTAssertEqual(model.document?.entries(.contexts).map(\.name), ["remaining"])
+            XCTAssertNotNil(model.document?.entry(.clusters, named: "dev"), "Related entries are kept")
+            XCTAssertEqual(model.document?.currentContext, "")
+            XCTAssertEqual(model.selectedEntryNames, ["remaining"])
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), yaml, "Even immediate switching never saves deletion")
+            XCTAssertTrue(model.hasPendingChanges)
+            model.undo()
+            XCTAssertEqual(model.draftText, yaml)
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+            XCTAssertNil(model.editor)
+            XCTAssertFalse(model.canUndo, "The entire deletion is one Undo step")
+            model.redo()
+            XCTAssertEqual(model.document?.entries(.contexts).map(\.name), ["remaining"])
+            XCTAssertEqual(model.selectedEntryNames, ["remaining"])
+            model.undo()
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"], "Selection survives repeated Undo/Redo")
+        }
+    }
+
+    func testBulkDeletionUndoInYAMLRestoresSelectionWhenReturningToForms() async throws {
+        let yaml = """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        - {name: c, cluster: {server: 'https://c.invalid'}}
+        users:
+        - {name: a, user: {}}
+        - {name: b, user: {}}
+        - {name: c, user: {}}
+        contexts:
+        - {name: a, context: {cluster: c, user: c}}
+        - {name: b, context: {cluster: c, user: c}}
+        - {name: c, context: {cluster: c, user: c}}
+        current-context: c
+        """ + "\n"
+        for section in AppSection.configuration {
+            try await withModel(initial: yaml) { model, _ in
+                model.selectSection(section)
+                model.selectEntries(["a", "b"])
+                model.ask = { _, _, _ in 0 }
+                model.requestSelectionDeletion()
+                XCTAssertEqual(model.selectedEntryNames, ["c"])
+                model.selectSection(.contexts)
+                model.toggleRawEditor()
+                model.undo()
+                XCTAssertTrue(model.showRaw, "Undo keeps the YAML editor open")
+                XCTAssertNil(model.editor)
+                XCTAssertEqual(model.draftText, yaml)
+                model.toggleRawEditor()
+                XCTAssertEqual(model.section, section)
+                XCTAssertEqual(model.selectedEntryNames, ["a", "b"])
+                XCTAssertNil(model.editor)
+                model.redo()
+                XCTAssertEqual(model.selectedEntryNames, ["c"])
+            }
+        }
+    }
+
+    func testCancellingBulkDeletionPreservesDraftSelectionAndHistory() async throws {
+        try await withModel { model, _ in
+            model.editor?.fields["namespace"] = "pending"
+            model.selectEntries(["dev", "other"])
+            let draft = model.draftText
+            model.ask = { _, _, buttons in
+                XCTAssertEqual(buttons, ["Delete", "Cancel"])
+                XCTAssertFalse(model.canExportContexts)
+                XCTAssertFalse(model.canRequestSelectionDeletion)
+                return 1
+            }
+            model.requestSelectionDeletion()
+            XCTAssertFalse(model.sheetIsOpen)
+            XCTAssertEqual(model.draftText, draft)
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+            model.undo()
+            XCTAssertEqual(model.draftText, Self.fixture, "Cancelling adds no history step")
+        }
+    }
+
+    func testBulkDeletionOfClustersAndUsersStagesOneActionWithoutCleanup() async throws {
+        let yaml = """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        - {name: c, cluster: {server: 'https://c.invalid'}}
+        users:
+        - {name: a, user: {token: example}}
+        - {name: b, user: {token: example}}
+        - {name: c, user: {token: example}}
+        contexts: []
+        """ + "\n"
+        for section in [AppSection.clusters, .users] {
+            try await withModel(initial: yaml) { model, url in
+                let kind = try XCTUnwrap(section.kind)
+                let otherKind: EntryKind = section == .clusters ? .users : .clusters
+                model.selectSection(section)
+                model.selectEntries(["a", "b"])
+                XCTAssertTrue(model.hasMultipleSelection)
+                XCTAssertNil(model.editor)
+                XCTAssertFalse(model.canExportContexts)
+                model.ask = { title, _, buttons in
+                    XCTAssertEqual(title, "Delete 2 \(section.title.lowercased())?")
+                    XCTAssertEqual(buttons, ["Delete", "Cancel"])
+                    return 0
+                }
+                model.requestSelectionDeletion()
+                XCTAssertEqual(model.document?.entries(kind).map(\.name), ["c"])
+                XCTAssertEqual(model.document?.entries(otherKind).count, 3)
+                XCTAssertEqual(model.selectedEntryNames, ["c"])
+                XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), yaml)
+                model.selectSection(.contexts)
+                model.undo()
+                XCTAssertEqual(model.section, section)
+                XCTAssertEqual(model.selectedEntryNames, ["a", "b"])
+                XCTAssertEqual(model.draftText, yaml)
+                XCTAssertFalse(model.canUndo)
+            }
+        }
+    }
+
+    func testReferencedClustersAndUsersBlockTheWholeBulkDeletion() async throws {
+        let yaml = """
+        clusters:
+        - {name: free, cluster: {server: 'https://free.invalid'}}
+        - {name: used, cluster: {server: 'https://used.invalid'}}
+        users:
+        - {name: free, user: {}}
+        - {name: used, user: {}}
+        contexts:
+        - {name: context-a, context: {cluster: used, user: used}}
+        - {name: context-b, context: {cluster: used, user: used}}
+        current-context: context-a
+        """ + "\n"
+        for section in [AppSection.clusters, .users] {
+            try await withModel(initial: yaml) { model, _ in
+                model.selectSection(section)
+                model.selectEntries(["free", "used"])
+                var alerts = 0
+                model.ask = { title, detail, buttons in
+                    alerts += 1
+                    XCTAssertEqual(title, "Cannot delete selected items")
+                    XCTAssertEqual(buttons, ["OK"])
+                    for name in ["used", "context-a", "context-b"] { XCTAssertTrue(detail.contains(name)) }
+                    XCTAssertTrue(model.sheetIsOpen)
+                    return 0
+                }
+                model.requestSelectionDeletion()
+                XCTAssertEqual(alerts, 1)
+                XCTAssertEqual(model.draftText, yaml)
+                XCTAssertEqual(model.selectedEntryNames, ["free", "used"])
+                XCTAssertFalse(model.sheetIsOpen)
+                XCTAssertFalse(model.canUndo)
+                XCTAssertNil(model.errorMessage)
+            }
+        }
+    }
+
+    func testBulkContextDeletionPreservesUnselectedActiveContextAndAllRelatedEntries() async throws {
+        let yaml = """
+        clusters:
+        - {name: unused, cluster: {server: 'https://unused.invalid'}}
+        users:
+        - {name: unused, user: {token: example}}
+        contexts:
+        - {name: a, context: {cluster: unused, user: unused}}
+        - {name: b, context: {cluster: unused, user: unused}}
+        - {name: keep, context: {cluster: unused}}
+        current-context: keep
+        """ + "\n"
+        try await withModel(initial: yaml) { model, _ in
+            model.selectEntries(["a", "b"])
+            model.ask = { _, _, _ in 0 }
+            model.requestSelectionDeletion()
+            XCTAssertEqual(model.document?.currentContext, "keep")
+            XCTAssertNotNil(model.document?.entry(.users, named: "unused"), "Newly orphaned users are kept")
+            XCTAssertNotNil(model.document?.entry(.clusters, named: "unused"))
+        }
+    }
+
+    func testMultiSelectionSearchRenameAndSectionChangesWorkForEveryEntryKind() async throws {
+        let yaml = """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        users:
+        - {name: a, user: {}}
+        - {name: b, user: {}}
+        contexts:
+        - {name: a, context: {cluster: a}}
+        - {name: b, context: {cluster: b}}
+        """ + "\n"
+        for section in AppSection.configuration {
+            try await withModel(initial: yaml) { model, _ in
+                model.selectSection(section)
+                model.editor?.name = "renamed"
+                model.selectEntries(["a", "b"])
+                XCTAssertEqual(model.selectedEntryNames, ["renamed", "b"])
+                model.search = "renamed"
+                XCTAssertEqual(model.selectedEntryNames, ["renamed"])
+                XCTAssertEqual(model.editor?.originalName, "renamed")
+                model.search = "no-match"
+                XCTAssertTrue(model.selectedEntryNames.isEmpty)
+                model.search = ""
+                XCTAssertTrue(model.selectedEntryNames.isEmpty)
+                model.selectEntries(["renamed", "b"])
+                model.selectSection(.backups)
+                XCTAssertTrue(model.selectedEntryNames.isEmpty)
+                model.selectSection(section)
+                XCTAssertEqual(model.selectedEntryNames, ["b"], "Returning selects only the first visible entry")
+            }
+        }
+    }
+
+    func testQueuedSelectionCannotChangeTheItemsInADeletionConfirmation() async throws {
+        try await withModel { model, _ in
+            model.selectEntries(["dev", "other"])
+            model.queueEntrySelection(["other"])
+            var alerts = 0
+            model.ask = { _, _, _ in
+                alerts += 1
+                XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+                model.queueEntrySelection(["other"])
+                model.requestSelectionDeletion()
+                return 1
+            }
+            model.requestSelectionDeletion()
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertEqual(alerts, 1, "A confirmation cannot open another confirmation")
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+            XCTAssertFalse(model.sheetIsOpen)
+        }
+    }
+
+    func testConfirmationDoesNotApplyBulkDeletionToAnotherFile() async throws {
+        try await withModel { model, url in
+            let other = url.deletingLastPathComponent().appendingPathComponent("other-config")
+            try Data(Self.fixture.utf8).write(to: other)
+            model.selectEntries(["dev", "other"])
+            model.ask = { _, _, _ in
+                model.load(other)
+                return 0
+            }
+            model.requestSelectionDeletion()
+            XCTAssertEqual(model.snapshot?.url, other)
+            XCTAssertEqual(model.draftText, Self.fixture)
+            XCTAssertFalse(model.hasPendingChanges)
+            XCTAssertFalse(model.canUndo)
+            XCTAssertFalse(model.sheetIsOpen)
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
+            XCTAssertEqual(try String(contentsOf: other, encoding: .utf8), Self.fixture)
         }
     }
 
@@ -1484,24 +1753,182 @@ final class AppModelTests: XCTestCase {
             let table = try XCTUnwrap(Self.tables(in: host).first { $0.allowsMultipleSelection })
             table.selectRowIndexes(IndexSet(integersIn: 0..<2), byExtendingSelection: false)
             try await Task.sleep(for: .milliseconds(100))
-            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
-            XCTAssertTrue(model.hasMultipleContextSelection)
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+            XCTAssertTrue(model.hasMultipleSelection)
             XCTAssertNil(model.editor)
             table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
             try await Task.sleep(for: .milliseconds(100))
-            XCTAssertEqual(model.selectedContextNames, ["other"])
+            XCTAssertEqual(model.selectedEntryNames, ["other"])
             XCTAssertEqual(model.editor?.originalName, "other")
             model.editor?.name = "renamed"
             model.commitForm()
             try await Task.sleep(for: .milliseconds(100))
-            XCTAssertEqual(model.selectedContextNames, ["renamed"])
+            XCTAssertEqual(model.selectedEntryNames, ["renamed"])
             XCTAssertEqual(model.editor?.originalName, "renamed")
-            model.selectContexts(["dev", "renamed"])
+            model.selectEntries(["dev", "renamed"])
             model.toggleRawEditor()
             try await Task.sleep(for: .milliseconds(100))
             model.toggleRawEditor()
             try await Task.sleep(for: .milliseconds(100))
-            XCTAssertEqual(model.selectedContextNames, ["dev", "renamed"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "renamed"])
+            XCTAssertNil(model.editor)
+        }
+    }
+
+    func testNativeContextMenuHonorsItsTargetDuringMultiSelection() async throws {
+        let yaml = """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        - {name: c, cluster: {server: 'https://c.invalid'}}
+        - {name: shared, cluster: {server: 'https://shared.invalid'}}
+        users:
+        - {name: a, user: {}}
+        - {name: b, user: {}}
+        - {name: c, user: {}}
+        - {name: shared, user: {}}
+        contexts:
+        - {name: a, context: {cluster: shared, user: shared}}
+        - {name: b, context: {cluster: shared, user: shared}}
+        - {name: c, context: {cluster: shared, user: shared}}
+        current-context: a
+        """ + "\n"
+        for section in AppSection.configuration {
+            try await withModel(initial: yaml) { model, _ in
+                let kind = try XCTUnwrap(section.kind)
+                model.selectSection(section)
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+                                      styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                let host = NSHostingView(rootView: MainView(model: model))
+                window.contentView = host
+                window.orderFront(nil)
+                defer { window.orderOut(nil) }
+                try await Task.sleep(for: .milliseconds(200))
+
+                @MainActor func invokeMenuItem(_ title: String, onRow row: Int) async throws {
+                    let table = try XCTUnwrap(Self.tables(in: host).first { $0.allowsMultipleSelection })
+                    let point = table.convert(NSPoint(x: 25, y: table.rect(ofRow: row).midY), to: nil)
+                    let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point,
+                        modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+                        context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+                    let menu = try XCTUnwrap(table.menu(for: event))
+                    menu.update()
+                    let index = try XCTUnwrap(menu.items.firstIndex { $0.title == title })
+                    XCTAssertTrue(menu.items[index].isEnabled)
+                    menu.performActionForItem(at: index)
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+
+                model.selectEntries(["a", "b"])
+                try await Task.sleep(for: .milliseconds(100))
+                var alerts = 0
+                model.ask = { title, _, _ in
+                    alerts += 1
+                    XCTAssertEqual(title, "Delete 2 \(section.title.lowercased())?")
+                    XCTAssertEqual(model.selectedEntryNames, ["a", "b"], "Right-click inside the selection targets the whole batch")
+                    return 1
+                }
+                try await invokeMenuItem("Delete 2 Items…", onRow: 0)
+                XCTAssertEqual(alerts, 1)
+                XCTAssertEqual(model.draftText, yaml)
+                try await invokeMenuItem("Delete", onRow: 2)
+                XCTAssertNil(model.document?.entry(kind, named: "c"), "Right-click outside the selection targets only that row")
+                XCTAssertNotNil(model.document?.entry(kind, named: "a"))
+                XCTAssertNotNil(model.document?.entry(kind, named: "b"))
+                XCTAssertNil(model.errorMessage)
+                model.undo()
+                model.selectEntries(["a", "b"])
+                try await Task.sleep(for: .milliseconds(100))
+                try await invokeMenuItem("Duplicate", onRow: 2)
+                XCTAssertEqual(model.selectedEntryNames, ["c-copy"])
+                XCTAssertNotNil(model.document?.entry(kind, named: "c-copy"))
+                XCTAssertNil(model.document?.entry(kind, named: "a-copy"))
+                model.undo()
+
+                if section == .contexts {
+                    model.selectEntries(["a", "b"])
+                    try await Task.sleep(for: .milliseconds(100))
+                    try await invokeMenuItem("Make Active", onRow: 2)
+                    XCTAssertEqual(model.document?.currentContext, "c")
+                    model.selectEntries(["a", "b"])
+                    try await Task.sleep(for: .milliseconds(100))
+                    try await invokeMenuItem("Clear Active Context", onRow: 2)
+                    XCTAssertEqual(model.document?.currentContext, "")
+                }
+            }
+        }
+    }
+
+    func testNativeClusterAndUserListsSupportMultipleSelection() async throws {
+        let yaml = """
+        clusters:
+        - {name: a, cluster: {server: 'https://a.invalid'}}
+        - {name: b, cluster: {server: 'https://b.invalid'}}
+        users:
+        - {name: a, user: {}}
+        - {name: b, user: {}}
+        contexts: []
+        """ + "\n"
+        try await withModel(initial: yaml) { model, _ in
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),
+                                  styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: MainView(model: model))
+            window.contentView = host
+            window.orderFront(nil)
+            defer { window.orderOut(nil) }
+            for section in [AppSection.clusters, .users] {
+                model.selectSection(section)
+                try await Task.sleep(for: .milliseconds(200))
+                let table = try XCTUnwrap(Self.tables(in: host).first { $0.allowsMultipleSelection })
+                table.selectRowIndexes(IndexSet(integersIn: 0..<2), byExtendingSelection: false)
+                try await Task.sleep(for: .milliseconds(100))
+                XCTAssertEqual(model.selectedEntryNames, ["a", "b"])
+                XCTAssertTrue(model.hasMultipleSelection)
+                XCTAssertNil(model.editor)
+                var alerts = 0
+                model.ask = { title, _, _ in
+                    alerts += 1
+                    XCTAssertEqual(title, "Delete 2 \(section.title.lowercased())?")
+                    XCTAssertEqual(model.selectedEntryNames, ["a", "b"])
+                    return 1
+                }
+                model.requestSelectionDeletion()
+                XCTAssertEqual(alerts, 1)
+                try await Task.sleep(for: .milliseconds(100))
+                XCTAssertEqual(model.selectedEntryNames, ["a", "b"])
+            }
+        }
+    }
+
+    func testBulkDeletionChoosesOnlyVisibleRemainingEntriesAndCanLeaveNoSelection() async throws {
+        let yaml = """
+        clusters:
+        - {name: a-hidden, cluster: {server: 'https://example.invalid'}}
+        - {name: b-visible, cluster: {server: 'https://example.invalid'}}
+        - {name: c-visible, cluster: {server: 'https://example.invalid'}}
+        - {name: d-visible, cluster: {server: 'https://example.invalid'}}
+        users: []
+        contexts: []
+        """ + "\n"
+        try await withModel(initial: yaml) { model, _ in
+            model.selectSection(.clusters)
+            model.search = "visible"
+            model.selectEntries(["b-visible", "c-visible"])
+            model.ask = { _, _, _ in 0 }
+            model.requestSelectionDeletion()
+            XCTAssertEqual(model.search, "visible")
+            XCTAssertEqual(model.selectedEntryNames, ["d-visible"])
+            XCTAssertEqual(model.editor?.originalName, "d-visible")
+            model.undo()
+            XCTAssertEqual(model.selectedEntryNames, ["b-visible", "c-visible"])
+            model.selectEntries(Set(model.visibleEntries.map(\.name)))
+            model.ask = { _, _, _ in 0 }
+            model.requestSelectionDeletion()
+            XCTAssertEqual(model.document?.entries(.clusters).count, 0)
+            XCTAssertTrue(model.selectedEntryNames.isEmpty)
+            XCTAssertNil(model.selectedName)
             XCTAssertNil(model.editor)
         }
     }
@@ -1526,9 +1953,9 @@ final class AppModelTests: XCTestCase {
             try Data(yaml.utf8).write(to: next)
             table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
             model.load(next)
-            XCTAssertEqual(model.selectedContextNames, ["aaa"])
+            XCTAssertEqual(model.selectedEntryNames, ["aaa"])
             try await Task.sleep(for: .milliseconds(100))
-            XCTAssertEqual(model.selectedContextNames, ["aaa"])
+            XCTAssertEqual(model.selectedEntryNames, ["aaa"])
             XCTAssertEqual(model.editor?.originalName, "aaa")
             XCTAssertEqual(model.snapshot?.url, next)
         }
@@ -1536,41 +1963,41 @@ final class AppModelTests: XCTestCase {
 
     func testQueuedContextSelectionsCoalesceAndExpireWhenTheWorkspaceChanges() async throws {
         try await withModel { model, _ in
-            model.queueContextSelection(["other"])
-            model.queueContextSelection(["dev", "other"])
+            model.queueEntrySelection(["other"])
+            model.queueEntrySelection(["dev", "other"])
             try await Task.sleep(for: .milliseconds(30))
-            XCTAssertEqual(model.selectedContextNames, ["dev", "other"], "The latest queued request wins")
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"], "The latest queued request wins")
 
-            model.queueContextSelection(["other"])
+            model.queueEntrySelection(["other"])
             model.selectEntry("dev")
             try await Task.sleep(for: .milliseconds(30))
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
 
-            model.queueContextSelection(["other"])
+            model.queueEntrySelection(["other"])
             model.search = "dev"
             try await Task.sleep(for: .milliseconds(30))
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             model.search = ""
 
-            model.queueContextSelection(["other"])
+            model.queueEntrySelection(["other"])
             model.toggleRawEditor()
             model.toggleRawEditor()
             try await Task.sleep(for: .milliseconds(30))
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
 
-            model.queueContextSelection(["other"])
+            model.queueEntrySelection(["other"])
             model.selectSection(.clusters)
             model.selectSection(.contexts)
             try await Task.sleep(for: .milliseconds(30))
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
         }
     }
 
     func testContextMultiSelectionFollowsARenameCommittedByTheSelectionChange() async throws {
         try await withModel { model, _ in
             model.editor?.name = "renamed"
-            model.selectContexts(["dev", "other"])
-            XCTAssertEqual(model.selectedContextNames, ["renamed", "other"])
+            model.selectEntries(["dev", "other"])
+            XCTAssertEqual(model.selectedEntryNames, ["renamed", "other"])
             model.requestContextExport()
             XCTAssertEqual(Set(try exportedDocument(model).entries(.contexts).map(\.name)), ["renamed", "other"])
         }
@@ -1585,7 +2012,7 @@ final class AppModelTests: XCTestCase {
             model.requestContextExport()
             XCTAssertNil(model.errorMessage)
             XCTAssertEqual(model.search, "")
-            XCTAssertEqual(model.selectedContextNames, ["renamed"])
+            XCTAssertEqual(model.selectedEntryNames, ["renamed"])
             let exported = try exportedDocument(model)
             XCTAssertEqual(exported.entries(.contexts).map(\.name), ["renamed"])
             XCTAssertEqual(exported.entry(.contexts, named: "renamed")?.value("namespace"), "pending")
@@ -1597,8 +2024,8 @@ final class AppModelTests: XCTestCase {
     func testInvalidFormPreventsChangingContextSelectionOrExporting() async throws {
         try await withModel { model, _ in
             model.editor?.name = ""
-            model.selectContexts(["dev", "other"])
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            model.selectEntries(["dev", "other"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             XCTAssertEqual(model.editor?.name, "")
             model.errorMessage = nil
             model.requestContextExport()
@@ -1609,19 +2036,19 @@ final class AppModelTests: XCTestCase {
 
     func testSearchRemovesHiddenContextsFromSelectionAndExport() async throws {
         try await withModel { model, _ in
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.search = "other"
-            XCTAssertEqual(model.selectedContextNames, ["other"])
+            XCTAssertEqual(model.selectedEntryNames, ["other"])
             XCTAssertEqual(model.editor?.originalName, "other")
             model.requestContextExport()
             XCTAssertEqual(try exportedDocument(model).entries(.contexts).map(\.name), ["other"])
             model.closeContextExport()
             model.search = "no-match"
-            XCTAssertTrue(model.selectedContextNames.isEmpty)
+            XCTAssertTrue(model.selectedEntryNames.isEmpty)
             XCTAssertNil(model.editor)
             XCTAssertFalse(model.canExportContexts)
             model.search = ""
-            XCTAssertTrue(model.selectedContextNames.isEmpty, "Clearing search must not silently reselect hidden entries")
+            XCTAssertTrue(model.selectedEntryNames.isEmpty, "Clearing search must not silently reselect hidden entries")
         }
     }
 
@@ -1630,7 +2057,7 @@ final class AppModelTests: XCTestCase {
             model.editor?.name = ""
             model.search = "other"
             XCTAssertEqual(model.search, "")
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             XCTAssertEqual(model.editor?.name, "")
             XCTAssertNotNil(model.errorMessage)
         }
@@ -1638,12 +2065,12 @@ final class AppModelTests: XCTestCase {
 
     func testExportAvailabilityAndSelectionAcrossModesSectionsAndSheets() async throws {
         try await withModel { model, _ in
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.toggleRawEditor()
             XCTAssertFalse(model.canExportContexts)
             model.toggleRawEditor()
-            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
-            XCTAssertTrue(model.hasMultipleContextSelection)
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
+            XCTAssertTrue(model.hasMultipleSelection)
             model.showImportSource = true
             XCTAssertFalse(model.canExportContexts)
             model.requestContextExport()
@@ -1651,9 +2078,9 @@ final class AppModelTests: XCTestCase {
             model.showImportSource = false
             model.selectSection(.clusters)
             XCTAssertFalse(model.canExportContexts)
-            XCTAssertTrue(model.selectedContextNames.isEmpty)
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             model.selectSection(.contexts)
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             model.requestContextExport()
             XCTAssertTrue(model.sheetIsOpen)
             XCTAssertFalse(model.canExportContexts)
@@ -1676,7 +2103,7 @@ final class AppModelTests: XCTestCase {
             try model.saveContextExport()
             XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), plan.yaml)
             XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             XCTAssertTrue(model.hasPendingChanges)
             XCTAssertNil(model.contextExportPlan)
             let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
@@ -1688,12 +2115,12 @@ final class AppModelTests: XCTestCase {
 
     func testCancelledOrFailedContextExportKeepsTheReviewAndSelection() async throws {
         try await withModel { model, url in
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.requestContextExport()
             model.chooseExportURL = { _, _ in nil }
             try model.saveContextExport()
             XCTAssertNotNil(model.contextExportPlan)
-            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
             model.chooseExportURL = { _, _ in url }
             XCTAssertThrowsError(try model.saveContextExport())
             let alias = url.deletingLastPathComponent().appendingPathComponent("alias")
@@ -1702,7 +2129,7 @@ final class AppModelTests: XCTestCase {
             XCTAssertThrowsError(try model.saveContextExport())
             XCTAssertNotNil(model.contextExportPlan)
             XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), Self.fixture)
-            XCTAssertEqual(model.selectedContextNames, ["dev", "other"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev", "other"])
         }
     }
 
@@ -1711,7 +2138,7 @@ final class AppModelTests: XCTestCase {
         try await withModel(initial: yaml) { model, url in
             let certificate = url.deletingLastPathComponent().appendingPathComponent("ca.pem")
             try Data("certificate".utf8).write(to: certificate)
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.requestContextExport()
             let plan = try XCTUnwrap(model.contextExportPlan)
             XCTAssertTrue(plan.sourceFiles.contains(certificate.standardizedFileURL))
@@ -1762,7 +2189,7 @@ final class AppModelTests: XCTestCase {
             XCTAssertNil(model.contextExportPlan)
             XCTAssertNotNil(model.errorMessage)
             XCTAssertTrue(model.hasPendingChanges)
-            XCTAssertEqual(model.selectedContextNames, ["dev"])
+            XCTAssertEqual(model.selectedEntryNames, ["dev"])
             try Data("certificate".utf8).write(to: url.deletingLastPathComponent().appendingPathComponent("ca.pem"))
             model.errorMessage = nil
             model.requestContextExport()
@@ -2234,11 +2661,11 @@ extension AppModelTests {
     func testAQueuedSelectionSurvivesACommitThatKeepsTheSelection() async throws {
         try await withModel { model, _ in
             model.editor?.fields["namespace"] = "changed"
-            model.queueContextSelection(["other"])
+            model.queueEntrySelection(["other"])
             model.commitForm()
             await Task.yield()
             try await Task.sleep(for: .milliseconds(20))
-            XCTAssertEqual(model.selectedContextNames, ["other"])
+            XCTAssertEqual(model.selectedEntryNames, ["other"])
         }
     }
 
@@ -2365,12 +2792,12 @@ extension AppModelTests {
 
     func testRemovingAWholeMultipleSelectionInYAMLFallsBackToTheFirstEntry() async throws {
         try await withModel { model, _ in
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.toggleRawEditor()
             model.editRaw(Self.fixture.replacingOccurrences(of: "name: dev\n  context", with: "name: kept\n  context")
                 .replacingOccurrences(of: "name: other", with: "name: another"))
             model.toggleRawEditor()
-            XCTAssertEqual(model.selectedContextNames, ["another"])
+            XCTAssertEqual(model.selectedEntryNames, ["another"])
             XCTAssertEqual(model.editor?.originalName, "another")
         }
     }
@@ -2384,7 +2811,7 @@ extension AppModelTests {
             model.closeImport()
             try model.store.backups.savePrevious(Data("key: value\n".utf8), for: XCTUnwrap(model.snapshot).resolvedURL, retention: 10)
             model.refreshBackups()
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             model.requestContextExport()
             let export = try XCTUnwrap(model.contextExportPlan)
 
@@ -2402,7 +2829,7 @@ extension AppModelTests {
             try await render(ImportSourceSheet(model: model))
             try await render(ImportSheet(model: model, initialPlan: plan))
             try await render(ContextExportSheet(model: model, plan: export))
-            try await render(ContextSelectionSummary(model: model))
+            try await render(EntrySelectionSummary(model: model))
             try await render(PreferencesView())
             model.closeContextExport()
             model.selectSection(.backups)
@@ -2807,7 +3234,7 @@ extension AppModelTests {
 
     func testK9sIsBlockedForSeveralContexts() async throws {
         try await withK9s { model, _, _ in
-            model.selectContexts(["dev", "other"])
+            model.selectEntries(["dev", "other"])
             XCTAssertNotNil(model.k9sBlockReason("dev"))
         }
     }
