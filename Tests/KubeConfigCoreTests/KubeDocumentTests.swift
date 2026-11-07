@@ -171,6 +171,13 @@ final class KubeDocumentTests: XCTestCase {
         XCTAssertEqual(doc, try Fixtures.document())
     }
 
+    func testSettingCurrentContextPatchesAFirstLineAfterAByteOrderMark() throws {
+        let yaml = "\u{FEFF}current-context: dev # note\ncontexts:\n- {name: dev, context: {}}\n- {name: other, context: {}}\n"
+        let patched = try XCTUnwrap(KubeDocument.settingCurrentContext("other", in: yaml))
+        XCTAssertEqual(patched, "\u{FEFF}current-context: other # note\ncontexts:\n- {name: dev, context: {}}\n- {name: other, context: {}}\n")
+        XCTAssertEqual(try KubeDocument(yaml: patched).currentContext, "other")
+    }
+
     func testExplicitStringTagsStayStringsThroughSerialization() throws {
         let doc = try KubeDocument(yaml: "users:\n- name: u\n  user:\n    password: !!str 1234\n    token: !!str true\n")
         XCTAssertEqual(doc.validationIssues, [])

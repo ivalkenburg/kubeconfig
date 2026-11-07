@@ -216,8 +216,9 @@ public struct KubeDocument: Equatable {
         root["current-context"] = Self.string(name)
     }
 
+    /// Group 1 is the key and its value. A byte order mark can come before a key on the first line, and stays.
     private static let currentContextValue = try! NSRegularExpression(
-        pattern: #"^current-context[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\r\n]|'')*'|(?!#)(?:(?![ \t]+#)[^\r\n])*)"#,
+        pattern: #"^\x{FEFF}?(current-context[ \t]*:[ \t]*(?:"(?:[^"\\\r\n]|\\.)*"|'(?:[^'\r\n]|'')*'|(?!#)(?:(?![ \t]+#)[^\r\n])*))"#,
         options: .anchorsMatchLines)
 
     /// Changes only the active context in `yaml`, keeping comments and formatting, since a switch skips the diff.
@@ -228,7 +229,7 @@ public struct KubeDocument: Equatable {
         guard (try? expected.setCurrentContext(name)) != nil,
               let line = try? Yams.serialize(node: Node([(Node("current-context"), string(name))]), width: -1, allowUnicode: true) else { return nil }
         let patched: String
-        if let match = currentContextValue.firstMatch(in: yaml, range: NSRange(yaml.startIndex..., in: yaml)), let range = Range(match.range, in: yaml) {
+        if let match = currentContextValue.firstMatch(in: yaml, range: NSRange(yaml.startIndex..., in: yaml)), let range = Range(match.range(at: 1), in: yaml) {
             patched = yaml.replacingCharacters(in: range, with: line.trimmingCharacters(in: .newlines))
         } else {
             let lineBreak = yaml.contains("\r\n") ? "\r\n" : "\n"
