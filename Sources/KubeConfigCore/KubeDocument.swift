@@ -52,13 +52,13 @@ public enum EntryKind: String, CaseIterable, Identifiable {
 public struct ConfigEntry: Identifiable, Equatable {
     public let kind: EntryKind
     public internal(set) var node: Node
-    public var name: String { node["name"]?.string ?? "" }
+    public var name: String { node.field("name")?.string ?? "" }
     public var id: String { name }
-    public var fields: Node { node[kind.singular] ?? .emptyMapping }
-    public func value(_ key: String) -> String { fields[key]?.text ?? "" }
+    public var fields: Node { node.field(kind.singular) ?? .emptyMapping }
+    public func value(_ key: String) -> String { fields.field(key)?.text ?? "" }
     /// client-go accepts y/n as booleans; Yams' Bool accessor omits those spellings.
     public func booleanValue(_ key: String) -> Bool? {
-        guard let value = fields[key], value.tag == Tag(.bool) else { return nil }
+        guard let value = fields.field(key), value.tag == Tag.bool else { return nil }
         switch value.string?.lowercased() {
         case "true", "yes", "y", "on": return true
         case "false", "no", "n", "off": return false
@@ -66,7 +66,7 @@ public struct ConfigEntry: Identifiable, Equatable {
         }
     }
     /// Whether the field holds anything but a YAML null, which counts as leaving it out.
-    public func has(_ key: String) -> Bool { fields[key].map { $0.tag != Tag(.null) } ?? false }
+    public func has(_ key: String) -> Bool { fields.field(key).map { $0.tag != Tag.null } ?? false }
     public var authenticationSummary: String {
         if has("exec") { return "Credential plugin" }
         if has("auth-provider") { return "Authentication provider" }
@@ -113,12 +113,12 @@ public struct KubeDocument: Equatable {
         // Rewriting the tree doubled parse time, and the draft is parsed on every keystroke. Tags have forms besides `!!str`.
         if yaml.utf8.contains(UInt8(ascii: "!")) { root = Self.keepingStrings(root) }
         for kind in EntryKind.allCases {
-            guard let node = root[kind.rawValue], node.null == nil else { continue }
+            guard let node = root.field(kind.rawValue), node.null == nil else { continue }
             guard node.sequence != nil else { throw ConfigError.invalid("\(kind.title) must be a YAML list.") }
             var seen = Set<String>()
             for entry in entries(kind) {
                 guard entry.node.mapping != nil, !entry.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                      entry.node["name"]?.tag == Tag(.str), entry.node[kind.singular]?.mapping != nil else {
+                      entry.node.field("name")?.tag == Tag.str, entry.node.field(kind.singular)?.mapping != nil else {
                     throw ConfigError.invalid("Each \(kind.singular) needs a string name and a ‘\(kind.singular)’ mapping.")
                 }
                 guard seen.insert(entry.name).inserted else { throw ConfigError.invalid("Duplicate \(kind.singular) name: \(entry.name). Rename it in YAML before continuing.") }
@@ -128,10 +128,10 @@ public struct KubeDocument: Equatable {
 
     public static let empty = try! KubeDocument(yaml: "apiVersion: v1\nkind: Config\nclusters: []\nusers: []\ncontexts: []\ncurrent-context: \"\"\n")
 
-    public var currentContext: String { root["current-context"]?.text ?? "" }
+    public var currentContext: String { root.field("current-context")?.text ?? "" }
 
     public func entries(_ kind: EntryKind) -> [ConfigEntry] {
-        (root[kind.rawValue]?.array() ?? []).map { ConfigEntry(kind: kind, node: $0) }
+        (root.field(kind.rawValue)?.array() ?? []).map { ConfigEntry(kind: kind, node: $0) }
     }
 
     public func entry(_ kind: EntryKind, named name: String) -> ConfigEntry? {
@@ -150,9 +150,9 @@ public struct KubeDocument: Equatable {
 
     public var validationIssues: [String] {
         var issues: [String] = []
-        if let version = root["apiVersion"], version.string != "v1" { issues.append("apiVersion must be v1.") }
-        if let kind = root["kind"], kind.string != "Config" { issues.append("kind must be Config.") }
-        if let current = root["current-context"], current.tag != Tag(.str) && current.null == nil {
+        if let version = root.field("apiVersion"), version.string != "v1" { issues.append("apiVersion must be v1.") }
+        if let kind = root.field("kind"), kind.string != "Config" { issues.append("kind must be Config.") }
+        if let current = root.field("current-context"), current.tag != Tag.str && current.null == nil {
             issues.append("current-context must be a string.")
         }
         let clusters = entries(.clusters), users = entries(.users), contexts = entries(.contexts)
@@ -162,7 +162,7 @@ public struct KubeDocument: Equatable {
             }
             issues += Self.stringFieldIssues(cluster, keys: ["server", "certificate-authority", "certificate-authority-data", "tls-server-name", "proxy-url"])
             for key in ["insecure-skip-tls-verify", "disable-compression"] {
-                if let value = cluster.fields[key], value.null == nil && value.tag != Tag(.bool) {
+                if let value = cluster.fields.field(key), value.null == nil && value.tag != Tag.bool {
                     issues.append("\(key) in cluster ‘\(cluster.name)’ must be a boolean.")
                 }
             }
@@ -170,20 +170,21 @@ public struct KubeDocument: Equatable {
         for user in users {
             issues += Self.stringFieldIssues(user, keys:["username", "password", "token", "tokenFile", "client-certificate", "client-certificate-data", "client-key", "client-key-data", "as", "as-uid"])
             for key in ["exec", "auth-provider"] {
-                if let value = user.fields[key], value.null == nil && value.mapping == nil {
+                if let value = user.fields.field(key), value.null == nil && value.mapping == nil {
                     issues.append("\(key) in user ‘\(user.name)’ must be a mapping.")
                 }
             }
-            if let exec = user.fields["exec"], exec.mapping != nil {
-                if exec["command"]?.tag != Tag(.str) || exec["command"]?.string?.isEmpty != false {
+            if let exec = user.fields.field("exec"), exec.mapping != nil {
+                let command = exec.field("command")
+                if command?.tag != Tag.str || command?.string?.isEmpty != false {
                     issues.append("Credential plugin in user ‘\(user.name)’ needs a command string.")
                 }
-                if let args = exec["args"], args.null == nil,
-                   args.sequence == nil || args.array().contains(where: { $0.tag != Tag(.str) }) {
+                if let args = exec.field("args"), args.null == nil,
+                   args.sequence == nil || args.array().contains(where: { $0.tag != Tag.str }) {
                     issues.append("Credential plugin args in user ‘\(user.name)’ must be a list of strings.")
                 }
-                if let env = exec["env"], env.null == nil,
-                   env.sequence == nil || env.array().contains(where: { $0["name"]?.tag != Tag(.str) || $0["value"]?.tag != Tag(.str) }) {
+                if let env = exec.field("env"), env.null == nil,
+                   env.sequence == nil || env.array().contains(where: { $0.field("name")?.tag != Tag.str || $0.field("value")?.tag != Tag.str }) {
                     issues.append("Credential plugin env in user ‘\(user.name)’ must contain string name/value pairs.")
                 }
             }
@@ -241,7 +242,7 @@ public struct KubeDocument: Equatable {
         if let issue = nameIssue(kind, name: name, originalName: originalName) { throw ConfigError.invalid(issue) }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         var list = entries(kind).map(\.node)
-        let index = originalName.flatMap { old in list.firstIndex { $0["name"]?.string == old } }
+        let index = originalName.flatMap { old in list.firstIndex { $0.field("name")?.string == old } }
         if let originalName, index == nil { throw ConfigError.missingEntry(originalName) }
         var node = index.map { list[$0] } ?? Node([(Node("name"), Self.string(trimmed)), (Node(kind.singular), .emptyMapping)])
         node["name"] = Self.string(trimmed)
@@ -257,7 +258,7 @@ public struct KubeDocument: Equatable {
             if kind == .contexts && currentContext == originalName { root["current-context"] = Self.string(trimmed) }
             if kind != .contexts, !entries(.contexts).isEmpty {
                 var contexts = entries(.contexts).map(\.node)
-                for index in contexts.indices where contexts[index]["context"]?[kind.singular]?.text == originalName {
+                for index in contexts.indices where contexts[index].field("context")?.field(kind.singular)?.text == originalName {
                     contexts[index]["context"]?[kind.singular] = Self.string(trimmed)
                 }
                 root["contexts"] = Node(contexts)
@@ -374,13 +375,13 @@ public struct KubeDocument: Equatable {
             return Node(mapping.map { (keepingStrings($0.key), keepingStrings($0.value)) }, mapping.tag, mapping.style)
         }
         if let sequence = node.sequence { return Node(sequence.map(keepingStrings), sequence.tag, sequence.style) }
-        guard node.tag == Tag(.str), node.scalar?.style == .plain, let text = node.string else { return node }
+        guard node.tag == Tag.str, node.scalar?.style == .plain, let text = node.string else { return node }
         return string(text)
     }
 
     /// The emitter writes no tags, which changes the value: kubectl decodes `!!binary` and reads `!!int "5"` as a number.
     /// Nodes built here carry the implicit tag, and no tag of their own.
-    private static let strTag = Tag(.str), mapTag = Tag(.map), seqTag = Tag(.seq), implicitTag = Tag(.implicit)
+    private static let mapTag = Tag(.map), seqTag = Tag(.seq), implicitTag = Tag(.implicit)
 
     private static func collectLostTags(in node: Node, into tags: inout Set<String>) {
         if let mapping = node.mapping {
@@ -389,8 +390,8 @@ public struct KubeDocument: Equatable {
         } else if let sequence = node.sequence {
             if sequence.tag != seqTag, sequence.tag != implicitTag { tags.insert(displayName(of: sequence.tag)) }
             for value in sequence { collectLostTags(in: value, into: &tags) }
-        } else if let scalar = node.scalar, scalar.tag != strTag, scalar.tag != implicitTag {
-            let implied = scalar.style == .plain ? Tag(resolver.resolveTag(of: Node.scalar(Node.Scalar(scalar.string)))) : strTag
+        } else if let scalar = node.scalar, scalar.tag != Tag.str, scalar.tag != implicitTag {
+            let implied = scalar.style == .plain ? Tag(resolver.resolveTag(of: Node.scalar(Node.Scalar(scalar.string)))) : Tag.str
             if scalar.tag != implied { tags.insert(displayName(of: scalar.tag)) }
         }
     }
@@ -418,7 +419,7 @@ public struct KubeDocument: Equatable {
     private static func stringFieldIssues(_ entry: ConfigEntry, keys: [String]) -> [String] {
         let fields = entry.fields
         return keys.compactMap { key in
-            guard let value = fields[key], value.null == nil, value.tag != Tag(.str) else { return nil }
+            guard let value = fields.field(key), value.null == nil, value.tag != Tag.str else { return nil }
             return "\(key) in \(entry.kind.singular) ‘\(entry.name)’ must be a string."
         }
     }
@@ -431,7 +432,7 @@ public struct KubeDocument: Equatable {
             for pair in mapping {
                 // A plain << carries YAML's merge tag, so this comes before the string check.
                 guard pair.key.string != "<<" else { throw ConfigError.invalid("YAML merge keys (<<) are not supported. Expand the mapping before editing.") }
-                guard pair.key.string != nil, pair.key.tag == Tag(.str) else {
+                guard pair.key.string != nil, pair.key.tag == Tag.str else {
                     throw ConfigError.invalid("YAML mapping keys must be strings.")
                 }
                 try checkMappings(pair.value, depth: depth + 1, nodeCount: &nodeCount)
@@ -447,11 +448,23 @@ extension String {
     var isAbsolutePath: Bool { hasPrefix("/") }
 }
 
+extension Tag {
+    /// Shared, since `Tag(...)` allocates and tags are compared on every field read. Their names are explicit, so Yams never resolves them in place.
+    static let str = Tag(.str), null = Tag(.null), bool = Tag(.bool)
+}
+
 extension Node {
     static var emptyMapping: Node { Node([] as [(Node, Node)]) }
 
     /// The scalar's text, or nil for a YAML null, which `string` reads back as "null" or "~".
-    var text: String? { tag == Tag(.null) ? nil : string }
+    var text: String? { tag == Tag.null ? nil : string }
+
+    /// The value under a string key. Yams' `node["key"]` builds a key node and runs the resolver on it for every lookup,
+    /// which took most of validation and sorting. Parsing has checked that every key is a string.
+    func field(_ key: String) -> Node? {
+        guard case let .mapping(mapping) = self, let index = mapping.firstIndex(where: { $0.key.scalar?.string == key }) else { return nil }
+        return mapping[index].value
+    }
 
     mutating func remove(_ key: String) {
         guard var mapping else { return }

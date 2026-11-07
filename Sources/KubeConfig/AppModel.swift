@@ -310,14 +310,18 @@ final class AppModel: ObservableObject {
         guard let k9sSession else { return "k9s isn’t open" }
         return k9sSession.freshness == .removed ? "This context is no longer in the file" : k9sBlockReason(k9sSession.contextName)
     }
-    var selectedBackup: BackupSummary? { visibleBackups.first { $0.id == selectedBackupID } }
+    /// Checks only the selected backup against the search, rather than formatting every date.
+    var selectedBackup: BackupSummary? {
+        records.first { $0.id == selectedBackupID }.flatMap { matchesSearch($0) ? $0 : nil }
+    }
     var visibleBackups: [BackupSummary] {
-        guard !search.isEmpty else { return records }
-        return records.filter { record in
-            [record.createdAt.formatted(.backupFullDate),
-             record.createdAt.formatted(.backupDate),
-             record.createdAt.ISO8601Format()].contains { $0.localizedCaseInsensitiveContains(search) }
-        }
+        search.isEmpty ? records : records.filter(matchesSearch)
+    }
+    private func matchesSearch(_ record: BackupSummary) -> Bool {
+        guard !search.isEmpty else { return true }
+        return [record.createdAt.formatted(.backupFullDate),
+                record.createdAt.formatted(.backupDate),
+                record.createdAt.ISO8601Format()].contains { $0.localizedCaseInsensitiveContains(search) }
     }
     var visibleEntries: [ConfigEntry] {
         guard let kind = section.kind else { return [] }
