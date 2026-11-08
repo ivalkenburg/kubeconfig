@@ -4,6 +4,7 @@ import SwiftUI
 struct ContextExportSheet: View {
     @ObservedObject var model: AppModel
     @State private var issue: String?
+    @State private var copyFeedbackID: UUID?
     private let yaml: String
     @State private var coloredYAML: AttributedString?
 
@@ -16,7 +17,7 @@ struct ContextExportSheet: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 9) {
                 Text("Preview export").font(.title2).fontWeight(.semibold)
-                Text("Review the kubeconfig that will be saved.")
+                Text("Review the kubeconfig to copy or save.")
                     .font(.callout).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
             Divider()
@@ -33,6 +34,17 @@ struct ContextExportSheet: View {
             VStack(alignment: .leading, spacing: 12) {
                 if let issue { Label(issue, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.orange) }
                 HStack {
+                    Button(copyFeedbackID == nil ? "Copy" : "Copied") {
+                        model.copyToPasteboard(yaml)
+                        copyFeedbackID = UUID()
+                    }
+                    .help("Copy the complete kubeconfig to the clipboard")
+                    .task(id: copyFeedbackID) {
+                        guard copyFeedbackID != nil else { return }
+                        do { try await Task.sleep(for: .seconds(2)) }
+                        catch { return }
+                        copyFeedbackID = nil
+                    }
                     Spacer()
                     Button("Cancel", action: model.closeContextExport).keyboardShortcut(.cancelAction)
                     Button("Export…") {
