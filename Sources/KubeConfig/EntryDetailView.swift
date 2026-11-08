@@ -136,8 +136,8 @@ struct EntryDetailView: View {
 
 struct BackupDetailView: View {
     @ObservedObject var model: AppModel
-    /// Kept between updates, since every keystroke in the search field would otherwise color the file again.
-    @State private var coloredContents = AttributedString()
+    /// Kept between updates, so that only a new selection reads its file again.
+    @State private var contents = ""
     @State private var issue: String?
 
     var body: some View {
@@ -159,18 +159,12 @@ struct BackupDetailView: View {
                     ContentUnavailableView("Unable to show this backup", systemImage: "exclamationmark.triangle", description: Text(issue))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    ScrollView(model.wrapsYAML ? .vertical : [.horizontal, .vertical]) {
-                        Text(coloredContents)
-                            .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .topLeading).padding(20)
-                    }
-                    .defaultScrollAnchor(.topLeading)
-                    .background(Color(nsColor: .textBackgroundColor))
+                    YAMLPreview(text: contents, wraps: model.wrapsYAML)
                 }
             }
             .onChange(of: record.id, initial: true) {
                 do {
-                    coloredContents = YAMLStyle.attributed(try model.backupPreview(record))
+                    contents = try model.backupPreview(record)
                     issue = nil
                 } catch { issue = error.localizedDescription }
             }

@@ -2780,6 +2780,60 @@ extension AppModelTests {
         }
     }
 
+    /// Hosts a backup preview in a window, so that wrapping changes go through SwiftUI as they do in the app.
+    @MainActor private final class PreviewHarness {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+        let host: NSHostingView<AnyView>
+        init(text: String, wraps: Bool) {
+            window.isReleasedWhenClosed = false
+            host = NSHostingView(rootView: AnyView(EmptyView()))
+            window.contentView = host
+            show(text: text, wraps: wraps)
+            window.orderFront(nil)
+        }
+        func show(text: String, wraps: Bool) {
+            host.rootView = AnyView(YAMLPreview(text: text, wraps: wraps).frame(width: 400, height: 200))
+        }
+        var textView: NSTextView? { (scrollView(in: host)?.documentView as? NSTextView) }
+        private func scrollView(in view: NSView) -> NSScrollView? {
+            view.subviews.lazy.compactMap { ($0 as? NSScrollView) ?? self.scrollView(in: $0) }.first
+        }
+        deinit { MainActor.assumeIsolated { window.orderOut(nil) } }
+    }
+
+    @MainActor func testBackupPreviewUnwrapsWithoutWaitingForAnEvent() async throws {
+        let text = "note: " + String(repeating: "QUJD", count: 400) + "\n"
+        let preview = PreviewHarness(text: text, wraps: true)
+        try await Task.sleep(for: .milliseconds(200))
+        let textView = try XCTUnwrap(preview.textView)
+        XCTAssertLessThanOrEqual(textView.frame.width, 400)
+        preview.show(text: text, wraps: false)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertFalse(try XCTUnwrap(textView.textContainer).widthTracksTextView)
+        XCTAssertGreaterThan(textView.frame.width, 1000, "The long line is laid out on one row")
+        preview.show(text: text, wraps: true)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertLessThanOrEqual(textView.frame.width, 400)
+    }
+
+    @MainActor func testBackupPreviewColorsNewTextAndKeepsTheSelectionForTheSameText() async throws {
+        let preview = PreviewHarness(text: "key: value\n", wraps: false)
+        try await Task.sleep(for: .milliseconds(100))
+        let textView = try XCTUnwrap(preview.textView)
+        XCTAssertEqual(textView.string, "key: value\n")
+        let layout = try XCTUnwrap(textView.layoutManager)
+        XCTAssertEqual(layout.temporaryAttribute(.foregroundColor, atCharacterIndex: 0, effectiveRange: nil) as? NSColor, YAMLStyle.color(.key))
+        textView.setSelectedRange(NSRange(location: 2, length: 3))
+        preview.show(text: "key: value\n", wraps: true)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 2, length: 3), "Only a different backup starts over")
+        preview.show(text: "# note\n", wraps: true)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(textView.string, "# note\n")
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: 0))
+        XCTAssertEqual(layout.temporaryAttribute(.foregroundColor, atCharacterIndex: 0, effectiveRange: nil) as? NSColor, YAMLStyle.color(.comment))
+    }
+
     func testBackupPreviewShowsContentsEvenWhenTheyAreNotUTF8() async throws {
         try await withModel { model, _ in
             let snapshot = try XCTUnwrap(model.snapshot)

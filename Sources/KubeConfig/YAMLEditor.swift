@@ -38,6 +38,63 @@ enum YAMLStyle {
     }
 }
 
+/// Read-only YAML in a native text view, since a SwiftUI Text rebuilt and laid out the colored file on every change.
+struct YAMLPreview: NSViewRepresentable {
+    let text: String
+    let wraps: Bool
+
+    static let font = NSFont.monospacedSystemFont(ofSize: NSFont.preferredFont(forTextStyle: .callout).pointSize, weight: .regular)
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor
+        textView.textContainerInset = NSSize(width: 16, height: 20)
+        textView.setAccessibilityLabel("Backup YAML")
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView, let container = textView.textContainer else { return }
+        if context.coordinator.wraps != wraps {
+            context.coordinator.wraps = wraps
+            let unlimited = CGFloat.greatestFiniteMagnitude
+            scrollView.hasHorizontalScroller = !wraps
+            textView.isHorizontallyResizable = !wraps
+            textView.maxSize = NSSize(width: unlimited, height: unlimited)
+            container.widthTracksTextView = wraps
+            container.containerSize = NSSize(width: wraps ? max(0, scrollView.contentSize.width - textView.textContainerInset.width * 2) : unlimited, height: unlimited)
+            if wraps { textView.setFrameSize(NSSize(width: scrollView.contentSize.width, height: textView.frame.height)) }
+        }
+        guard context.coordinator.shownText != text, let storage = textView.textStorage, let layout = textView.layoutManager else { return }
+        context.coordinator.shownText = text
+        storage.setAttributedString(NSAttributedString(string: text, attributes: [.font: Self.font, .foregroundColor: NSColor.labelColor]))
+        if text.utf8.count <= YAMLStyle.highlightLimit {
+            for token in YAMLHighlighter.tokens(in: text) {
+                layout.addTemporaryAttribute(.foregroundColor, value: YAMLStyle.color(token.kind), forCharacterRange: NSRange(token.range))
+            }
+        }
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        textView.scroll(.zero)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var shownText = ""
+        /// Unset at first, since a new text view wraps by default.
+        var wraps: Bool?
+    }
+}
+
 /// The full-file editor: NSTextView for attribute-level coloring, a line-number gutter, and its own undo.
 struct YAMLEditor: NSViewRepresentable {
     @ObservedObject var model: AppModel
