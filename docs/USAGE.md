@@ -68,7 +68,7 @@ If the context, its cluster, or its user changes on disk during a session, a not
 
 After each successful Apply, the app saves the **exact previous file bytes**, including original comments, as a backup. Immediate context switches save none and don't prune history. Backups are isolated by the resolved configuration path. Settings controls retention per file: default 10, allowed range 0–1000. Zero disables backup creation. Reduced retention, including zero, prunes old history after the next successful changed Apply.
 
-Search backups by date, select one, and choose the rollback button or **Rollback…** from the right-click menu. It loads a draft; it does not write the file. Review and Apply to restore it. That Apply backs up the version being replaced, making rollback undoable. A malformed historical configuration can be staged for repair but cannot be applied until valid.
+Search backups by date, select one, and choose the rollback button or **Rollback…** from the right-click menu. It loads a draft; it does not write the file. Review and Apply to restore it. That Apply backs up the version being replaced, making rollback undoable. **Delete…** in the right-click menu, or the Delete key, removes a backup for good after asking; it isn't on the Undo history. A malformed historical configuration can be staged for repair but cannot be applied until valid.
 
 Backups are stored beneath:
 

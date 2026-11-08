@@ -2284,6 +2284,87 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    @MainActor private func applyNamespaces(_ model: AppModel, _ names: [String]) {
+        for name in names {
+            model.editor?.fields["namespace"] = name
+            model.requestReview()
+            model.commit()
+        }
+    }
+
+    func testDeletingABackupAsksFirstAndSelectsTheNextOne() async throws {
+        try await withModel { model, _ in
+            applyNamespaces(model, ["a", "b", "c"])
+            model.selectSection(.backups)
+            XCTAssertEqual(model.records.count, 3)
+            let records = model.records
+            model.selectedBackupID = records[1].id
+            var asked = 0
+            model.ask = { _, _, _ in asked += 1; return 1 }
+            model.deleteBackup(records[1].id)
+            XCTAssertEqual(model.records, records, "Cancel keeps the backup")
+            model.ask = { _, _, _ in asked += 1; return 0 }
+            model.deleteBackup(records[1].id)
+            XCTAssertEqual(asked, 2)
+            XCTAssertEqual(model.records, [records[0], records[2]])
+            XCTAssertEqual(model.selectedBackupID, records[2].id)
+            model.deleteBackup(records[2].id)
+            XCTAssertEqual(model.selectedBackupID, records[0].id, "The last row selects the one above it")
+            model.selectedBackupID = nil
+            model.deleteBackup(records[0].id)
+            XCTAssertTrue(model.records.isEmpty)
+            XCTAssertNil(model.selectedBackupID)
+            XCTAssertNil(model.errorMessage)
+            let folder = model.store.backups.location(for: model.snapshot!.resolvedURL)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [], "The summary goes with it")
+        }
+    }
+
+    func testDeletingAnUnselectedBackupKeepsTheSelection() async throws {
+        try await withModel { model, _ in
+            applyNamespaces(model, ["a", "b"])
+            model.selectSection(.backups)
+            let records = model.records
+            model.selectedBackupID = records[0].id
+            model.ask = { _, _, _ in 0 }
+            model.deleteBackup(records[1].id)
+            XCTAssertEqual(model.records, [records[0]])
+            XCTAssertEqual(model.selectedBackupID, records[0].id)
+        }
+    }
+
+    func testDeletingABackupSelectsTheNextOneTheSearchShows() async throws {
+        try await withModel { model, _ in
+            let resolved = try XCTUnwrap(model.snapshot).resolvedURL
+            // Only ISO times contain "T10:", so the search shows the first and last and hides the middle one.
+            for time in ["2024-03-03T10:00:00Z", "2024-03-04T11:00:00Z", "2024-03-05T10:00:00Z"] {
+                _ = try model.store.backups.savePrevious(Data(Self.fixture.utf8), for: resolved, retention: 10, now: try Date(time, strategy: .iso8601))
+            }
+            model.selectSection(.backups)
+            let records = model.records
+            model.search = "T10:"
+            XCTAssertEqual(model.visibleBackups, [records[0], records[2]])
+            model.selectedBackupID = records[0].id
+            model.ask = { _, _, _ in 0 }
+            model.deleteBackup(records[0].id)
+            XCTAssertEqual(model.selectedBackupID, records[2].id)
+            XCTAssertEqual(model.selectedBackup, records[2])
+        }
+    }
+
+    func testADamagedBackupCanBeDeleted() async throws {
+        try await withModel { model, _ in
+            applyNamespaces(model, ["a"])
+            let backup = try XCTUnwrap(model.records.first)
+            let file = model.store.backups.location(for: model.snapshot!.resolvedURL).appendingPathComponent(backup.id + ".json")
+            try Data("garbage".utf8).write(to: file)
+            model.ask = { _, _, _ in 0 }
+            model.deleteBackup(backup.id)
+            XCTAssertTrue(model.records.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        }
+    }
+
     func testABackupDamagedAfterListingCannotBePreviewedOrRolledBack() async throws {
         try await withModel { model, _ in
             model.editor?.fields["namespace"] = "changed"

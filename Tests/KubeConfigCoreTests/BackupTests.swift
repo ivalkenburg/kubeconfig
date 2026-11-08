@@ -13,6 +13,16 @@ final class BackupTests: FileTestCase {
         XCTAssertEqual(try backups.records(for: other).records.count, 1)
     }
 
+    func testRemovingABackupTakesItsSummaryEvenWhenTheFileIsAlreadyGone() throws {
+        let first = try XCTUnwrap(backups.savePrevious(Data("one".utf8), for: config, retention: 3))
+        let second = try XCTUnwrap(backups.savePrevious(Data("two".utf8), for: config, retention: 3))
+        let folder = backups.location(for: config)
+        try backups.remove(first.summary, for: config)
+        try FileManager.default.removeItem(at: folder.appendingPathComponent(second.id + ".json"))
+        try backups.remove(second.summary, for: config)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])
+    }
+
     func testBackupRootIsTightenedToTheOwner() throws {
         try FileManager.default.createDirectory(at: backups.directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
         _ = try backups.savePrevious(Data("old".utf8), for: config, retention: 3)

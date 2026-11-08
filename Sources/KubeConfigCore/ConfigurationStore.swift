@@ -173,9 +173,11 @@ public struct BackupStore {
         try verifiedRecord(at: fileURL(of: summary.id, for: configuration), for: configuration)
     }
 
+    /// A backup already gone from the folder still loses its summary, so nothing is left behind.
     public func remove(_ summary: BackupSummary, for configuration: URL) throws {
         let url = fileURL(of: summary.id, for: configuration)
-        try FileManager.default.removeItem(at: url)
+        do { try FileManager.default.removeItem(at: url) }
+        catch CocoaError.fileNoSuchFile {}
         try? FileManager.default.removeItem(at: summaryURL(of: url))
     }
 

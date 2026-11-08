@@ -277,8 +277,11 @@ struct MainView: View {
                 .contextMenu {
                     Button("Rollback…") { model.selectedBackupID = record.id; model.rollbackSelected() }
                     Button("Reveal in Finder", action: model.revealBackups)
+                    Divider()
+                    Button("Delete…", role: .destructive) { model.deleteBackup(record.id) }
                 }
             }.listStyle(.inset)
+            .onDeleteCommand { if let id = model.selectedBackup?.id { model.deleteBackup(id) } else { NSSound.beep() } }
         }
     }
 

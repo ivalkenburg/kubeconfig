@@ -1144,6 +1144,19 @@ final class AppModel: ObservableObject {
         return true
     }
 
+    /// Removes a backup for good, after asking, since it isn't on the Undo history.
+    func deleteBackup(_ id: String) {
+        guard let snapshot, let backup = records.first(where: { $0.id == id }) else { return }
+        let date = backup.createdAt.formatted(.backupFullDate)
+        guard ask("Delete the backup from \(date)?", "This removes it from the backup folder. It can’t be undone.", ["Delete", "Cancel"]) == 0 else { return }
+        reportingErrors { try store.backups.remove(backup, for: snapshot.resolvedURL) }
+        // The row that takes its place, among those the search shows, so stepping through and deleting stays in position.
+        let shown = visibleBackups
+        let next = selectedBackupID == id ? shown.firstIndex(of: backup).map { shown.count > 1 ? shown[$0 < shown.count - 1 ? $0 + 1 : $0 - 1].id : nil } : nil
+        refreshBackups()
+        if let next { selectedBackupID = next }
+    }
+
     func revealBackups() {
         guard let snapshot else { return }
         let folder = store.backups.location(for: snapshot.resolvedURL)
